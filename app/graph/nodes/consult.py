@@ -1,4 +1,14 @@
-"""Consult node — ReAct symptom gathering via consult agent."""
+"""
+Consult node — ReAct 症状问诊。
+
+将对话委托给 Consult Agent（app/agent/consult_agent.py），由 LLM 执行：
+  1. 分析用户新提供的信息
+  2. 更新症状槽位（consult_slots）
+  3. 判断信息是否充分
+  4. 决定继续追问还是完成收集
+
+本节点只是一个薄包装：处理 state 的读写，核心逻辑在 consult_agent.run_consult()。
+"""
 
 from app.agent.consult_agent import run_consult
 from app.graph.state import ConversationState
@@ -10,17 +20,28 @@ async def consult_node(
     llm_client: LLMClient,
     max_rounds: int = 6,
 ) -> dict:
-    """Run one round of consult: update slots, decide next action.
+    """执行一轮症状问诊。
 
-    Returns state updates including consult_slots, consult_next_action,
-    consult_summary, response, phase.
+    Args:
+        state:      当前对话状态
+        llm_client: LLM 客户端（注入）
+        max_rounds: 最大追问轮数。超过此数强制结束问诊，进入推荐
+
+    Returns:
+        state 更新 dict：
+          - consult_slots        → 更新后的症状槽位
+          - consult_next_action  → "ask"（继续追问）或 "done"（完成收集）
+          - consult_summary      → done 时的症状摘要
+          - response             → 回复文本（追问语或过渡语）
+          - phase                → "consulting"
+          - node_events          → 节点事件日志
     """
     messages = state.get("messages", [])
     slots = state.get("consult_slots", {})
     dispatcher_params = state.get("dispatcher_result", {}).get("params", {})
-    reset_slots = dispatcher_params.get("reset_slots", False)
 
-    # If user switched symptoms, reset slots
+    # 如果 Dispatcher 标记了 reset_slots（用户切换了症状描述），清空旧槽位
+    reset_slots = dispatcher_params.get("reset_slots", False)
     if reset_slots:
         slots = {
             "symptoms": [],
@@ -34,6 +55,7 @@ async def consult_node(
             "other_symptoms": [],
         }
 
+    # 委托给 Consult Agent（核心逻辑在 app/agent/consult_agent.py）
     result = await run_consult(
         llm_client=llm_client,
         messages=messages,
@@ -43,10 +65,10 @@ async def consult_node(
 
     return {
         "consult_slots": result.updated_slots,
-        "consult_next_action": result.next_action,
+        "consult_next_action": result.next_action,  # "ask" 或 "done"
         "consult_summary": result.summary,
         "response": result.response,
-        "phase": "consulting" if result.next_action == "ask" else "consulting",
+        "phase": "consulting",
         "node_events": [{
             "node": "consult",
             "next_action": result.next_action,

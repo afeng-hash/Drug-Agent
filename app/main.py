@@ -1,4 +1,17 @@
-"""FastAPI application entry point — OTC Drug AI Recommendation System."""
+"""
+FastAPI application entry point — OTC Drug AI Recommendation System.
+
+这是应用的主入口文件。负责：
+  1. 创建 FastAPI app 实例
+  2. 在 lifespan 中初始化所有后端服务（DB、LLM、规则引擎、RAG、Graph）
+  3. 注册 API 路由
+  4. 提供 _RepoContext 工具类（将 DB session 注入到 Repository）
+
+启动方式：
+  python -m app.main
+  或
+  uvicorn app.main:app --reload
+"""
 
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -24,33 +37,52 @@ from app.rules.engine import RuleEngine
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan — startup and shutdown hooks."""
-    # ── Startup ──
+    """应用生命周期管理 — startup 和 shutdown 钩子。
+
+    Startup 阶段（yield 之前）：
+      1. 加载配置（Settings）
+      2. 初始化数据库（创建引擎 + 连接池 + 自动建表）
+      3. 创建 LLM 客户端（通义千问）
+      4. 注册安全规则引擎
+      5. 初始化 Milvus 连接（可选，失败不阻止启动）
+      6. 创建 Repository 工厂（每个请求独立的 DB session）
+      7. 构建 LangGraph 状态机
+
+    Shutdown 阶段（yield 之后）：
+      1. 关闭数据库连接池
+    """
+    # ═══════════════════════════════════════════════
+    # Startup
+    # ═══════════════════════════════════════════════
+
     settings = Settings()
     app.state.settings = settings
 
-    # Database
+    # ── 数据库 ──
     await init_db(settings)
     app.state.db_initialized = True
 
-    # LLM Client
+    # ── LLM 客户端 ──
     llm_client = LLMClient(settings)
     app.state.llm_client = llm_client
 
-    # Rule Engine
+    # ── 规则引擎（注册所有安全规则） ──
     rule_engine = RuleEngine()
     register_all_rules(rule_engine)
     app.state.rule_engine = rule_engine
 
-    # Milvus + RAG Retriever
+    # ── Milvus + RAG 检索器 ──
     retriever = DrugManualRetriever(settings, llm_client)
     try:
         await retriever.ensure_collection()
     except Exception:
-        pass  # Milvus might not be available at startup
+        pass  # Milvus 可能没启动，不阻塞应用启动
+
     app.state.retriever = retriever
 
-    # Repository factories (per-request DB sessions)
+    # ── Repository 工厂 ──
+    # 每个 Graph run 会多次调用这些工厂，每次调用都会新开一个 DB session
+    # 用完即关（参见 _RepoContext），避免连接池泄露
     def drug_repo_factory():
         return _repo_context(DrugRepository)
 
@@ -63,7 +95,7 @@ async def lifespan(app: FastAPI):
     def safety_log_repo_factory():
         return _repo_context(SafetyLogRepository)
 
-    # Graph
+    # ── 构建 LangGraph ──
     graph = build_graph(
         llm_client=llm_client,
         rule_engine=rule_engine,
@@ -76,13 +108,16 @@ async def lifespan(app: FastAPI):
     )
     app.state.graph = graph
 
-    yield  # ── Application runs here ──
+    yield  # ══════════ 应用运行中 ══════════
 
-    # ── Shutdown ──
+    # ═══════════════════════════════════════════════
+    # Shutdown
+    # ═══════════════════════════════════════════════
     await close_db()
 
 
-# FastAPI app
+# ── FastAPI 实例 ──────────────────────────────────────────
+
 app = FastAPI(
     title="OTC Drug AI Recommendation System",
     description="感冒退烧 OTC 药品 AI 导购系统 — MVP",
@@ -90,7 +125,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow all origins in development
+# ── CORS（开发阶段允许所有来源） ──
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -99,51 +134,97 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register routes
-app.include_router(health_router)
-app.include_router(session_router)
-app.include_router(chat_router)
+# ── 注册路由 ──
+app.include_router(health_router)     # GET /health
+app.include_router(session_router)    # POST /api/v1/sessions, GET /api/v1/sessions/{id}
+app.include_router(chat_router)       # POST /api/v1/chat/{id} (SSE)
 
 
-# ── Repository context helper ──
-import asyncio
-
+# ──────────────────────────────────────────────────────────
+# Repository 上下文管理器
+# ──────────────────────────────────────────────────────────
+# Graph 节点（recommend / explain / inventory / end）需要
+# Repository 实例来操作数据库。但 Repository 需要一个 DB session。
+#
+# _RepoContext 的作用：
+#   在每次 Graph 节点调用时：
+#     1. 从连接池获取一个新 session（get_db）
+#     2. 用该 session 创建 Repository 实例
+#     3. 节点执行完毕后自动归还连接到池（__aexit__）
+#
+# 这样每个节点都有独立的短生命周期 DB session，不会互相干扰。
 
 class _RepoContext:
-    """Async context manager that wraps a repository with a DB session."""
+    """异步上下文管理器：为 Repository 自动管理 DB session 生命周期。
+
+    使用方式：
+        factory = _repo_context(DrugRepository)
+        async with factory() as drug_repo:
+            drug = await drug_repo.find_by_name("布洛芬")
+        # 退出 with 时自动关闭 session
+    """
 
     def __init__(self, repo_class, *extra_args):
+        """初始化。
+
+        Args:
+            repo_class:  Repository 类（DrugRepository / InventoryRepository 等）
+            *extra_args: 传给 Repository 构造函数的额外参数（如 expire_minutes）
+        """
         self.repo_class = repo_class
         self.extra_args = extra_args
-        self._db = None
-        self._repo = None
+        self._db_ctx = None   # get_db() 返回的上下文管理器
+        self._db = None        # AsyncSession 实例
+        self._repo = None      # Repository 实例
 
     async def __aenter__(self):
-        db_gen = get_db()
-        self._db = await anext(db_gen)
+        """进入上下文：获取 DB session → 创建 Repository。
+
+        Returns:
+            Repository 实例
+        """
+        self._db_ctx = get_db()
+        self._db = await self._db_ctx.__aenter__()
         self._repo = self.repo_class(self._db, *self.extra_args)
         return self._repo
 
     async def __aexit__(self, *args):
-        if self._db:
-            await self._db.close()
+        """退出上下文：关闭 session，归还连接到池。
+
+        get_db() 的 __aexit__ 会自动调用 session.close()
+        （async_sessionmaker 的上下文管理器已处理），不需要手动 close。
+        """
+        if self._db_ctx:
+            await self._db_ctx.__aexit__(*args)
 
 
 def _repo_context(repo_class, *extra_args):
-    """Create an async context manager factory for a repository."""
+    """创建一个 Repository 上下文管理器工厂。
+
+    注意返回值直接就是 _RepoContext 实例（它本身就实现了 __aenter__/__aexit__），
+    所以调用方可以写：async with _repo_context(DrugRepository) as repo:
+
+    Args:
+        repo_class:  Repository 类
+        *extra_args: 传给 Repository 构造函数的额外参数
+
+    Returns:
+        _RepoContext 实例（可直接用于 async with）
+    """
     def factory():
         return _RepoContext(repo_class, *extra_args)
     return factory()
 
 
-# ── Run ──
+# ── 直接启动 ────────────────────────────────────────────
+
 if __name__ == "__main__":
     import uvicorn
 
     settings = Settings()
     uvicorn.run(
         "app.main:app",
-        host=settings.app_host,
-        port=settings.app_port,
-        reload=settings.debug,
+        host=settings.app_host,  # 默认 0.0.0.0
+        port=settings.app_port,  # 默认 8000
+        reload=settings.debug,   # 开发模式自动重载
     )

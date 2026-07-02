@@ -1,8 +1,15 @@
-"""Session management endpoints — create, query sessions."""
+"""
+Session management endpoints — 会话的创建和查询。
+
+POST /api/v1/sessions        — 创建新会话
+GET  /api/v1/sessions/{id}   — 查询会话详情（含消息历史）
+
+会话是匿名的：不需要用户登录，用 UUID 标识。
+默认 30 分钟无活动自动过期。
+"""
 
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.schemas import SessionDetailResponse, SessionResponse
@@ -15,11 +22,19 @@ router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 
 @router.post("", response_model=SessionResponse, status_code=201)
 async def create_session(request: Request) -> SessionResponse:
-    """Create a new anonymous session."""
+    """创建一个新的匿名会话。
+
+    前端在每次新对话开始时调用此接口获取 session_id。
+    session_id 用于后续所有 POST /api/v1/chat/{session_id} 请求。
+
+    不需要请求体。
+
+    Returns:
+        201: SessionResponse（session_id, status, created_at, expires_at）
+    """
     settings = request.app.state.settings
-    db_gen = get_db()
-    db: AsyncSession = await anext(db_gen)
-    try:
+
+    async with get_db() as db:
         repo = SessionRepository(db, expire_minutes=settings.session_expire_minutes)
         session = await repo.create()
         return SessionResponse(
@@ -28,8 +43,6 @@ async def create_session(request: Request) -> SessionResponse:
             created_at=session.created_at.isoformat(),
             expires_at=session.expires_at.isoformat(),
         )
-    finally:
-        await db.close()
 
 
 @router.get("/{session_id}", response_model=SessionDetailResponse)
@@ -37,17 +50,33 @@ async def get_session(
     session_id: str,
     request: Request,
 ) -> SessionDetailResponse:
-    """Get session status and message history."""
+    """查询会话状态和历史消息。
+
+    可用于：
+      - 恢复对话（用户刷新页面后重建聊天记录）
+      - 检查会话是否过期
+      - 查看之前的推荐结果
+
+    Args:
+        session_id: 会话 UUID（路径参数）
+
+    Returns:
+        200: SessionDetailResponse（含消息列表）
+
+    Raises:
+        404: 会话不存在
+    """
     settings = request.app.state.settings
-    db_gen = get_db()
-    db: AsyncSession = await anext(db_gen)
-    try:
+
+    async with get_db() as db:
         repo = SessionRepository(db, expire_minutes=settings.session_expire_minutes)
+
+        # 查询并自动处理过期
         session = await repo.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # Eagerly load messages to avoid lazy-load issues
+        # 加载消息历史（eager load，避免 N+1）
         stmt = (
             select(SessionModel)
             .options(selectinload(SessionModel.messages))
@@ -74,5 +103,3 @@ async def get_session(
             expires_at=session.expires_at.isoformat(),
             messages=messages,
         )
-    finally:
-        await db.close()

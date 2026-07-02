@@ -1,4 +1,16 @@
-"""Recommend node — match symptoms to OTC drugs and generate recommendations."""
+"""
+Recommend node — 症状 → OTC 药品匹配推荐。
+
+这是推荐环节的核心节点：从数据库查询候选药品，用 LLM 对症状进行匹配排序，
+最终给出 1-3 个最合适的 OTC 药品推荐。
+
+流程：
+  1. 从 consult_slots 提取症状名称
+  2. 从数据库查询匹配的药品（按 category="感冒退烧" 过滤）
+  3. 排除 safe_excluded_drugs（安全规则过滤的药品）
+  4. 用 LLM 对候选药品排序（1-3 个）
+  5. 生成自然语言推荐回复
+"""
 
 import json
 
@@ -8,22 +20,29 @@ from app.db.repositories.drug import DrugRepository
 from app.llm.client import LLMClient
 
 
+# ── LLM 结构化输出 Schema ────────────────────────────────
+
 class RecommendationItem(BaseModel):
+    """单个推荐药品。"""
     drug_id: int
     generic_name: str
     match_reason: str
-    score: float = Field(ge=0.0, le=1.0)
+    score: float = Field(ge=0.0, le=1.0)  # 推荐度 0~1，越高越推荐
 
 
 class RecommendOutput(BaseModel):
+    """LLM 排序输出的推荐列表，最多 3 个。"""
     recommendations: list[RecommendationItem] = Field(max_length=3)
 
+
+# ── 回复模板 ──────────────────────────────────────────────
 
 DISCLAIMER = (
     "\n\n---\n"
     "📋 **免责声明**：本系统仅为辅助参考，请仔细阅读说明书并按说明使用，"
     "或在药师指导下购买和使用。如症状持续或加重，请及时就医。"
 )
+"""每条推荐回复末尾都会追加此免责声明"""
 
 
 async def recommend_node(
@@ -31,37 +50,43 @@ async def recommend_node(
     llm_client: LLMClient,
     drug_repo: DrugRepository,
 ) -> dict:
-    """Match symptoms to OTC drugs and generate top 1-3 recommendations.
+    """执行药品推荐。
 
     Args:
-        state: Current ConversationState.
-        llm_client: Injected LLM client.
-        drug_repo: Injected DrugRepository.
+        state:     当前对话状态
+        llm_client: LLM 客户端
+        drug_repo:  药品仓库（已绑定 DB session）
 
     Returns:
-        State updates including recommendations, response, phase.
+        state 更新 dict：
+          - recommendations → 推荐的药品列表（1-3 个）
+          - response        → 格式化的推荐回复文本（含免责声明）
+          - phase           → "recommending"
+          - node_events     → 节点事件日志
     """
     slots = state.get("consult_slots", {})
     summary = state.get("consult_summary", "")
     safety_result = state.get("safety_result") or {}
     excluded_drugs = safety_result.get("excluded_drugs", [])
 
-    # Extract symptom names for DB query
+    # ── 1. 从槽位提取症状名称 ──
     symptoms = slots.get("symptoms", [])
     symptom_names = [
         s.get("name", s) if isinstance(s, dict) else str(s)
         for s in symptoms
     ]
 
-    # Query drugs from DB
+    # ── 2. 从数据库查询候选药品 ──
     drugs = await drug_repo.find_by_symptoms(symptom_names, category="感冒退烧")
     if not drugs:
+        # 症状匹配不到药品 → 列出所有感冒退烧类药品作为兜底
         drugs = await drug_repo.list_all(category="感冒退烧")
 
-    # Filter out excluded drugs (from safety rules)
+    # ── 3. 排除安全规则过滤的药品 ──
+    # 例如用户对阿司匹林过敏 → 排除所有含阿司匹林的药品
     candidates = [d for d in drugs if d.generic_name not in excluded_drugs]
     if not candidates:
-        # All drugs excluded — this shouldn't normally happen
+        # 所有候选药品都被安全规则排除了 → 返回抱歉消息
         return {
             "recommendations": [],
             "response": "抱歉，根据您的情况，目前没有合适的OTC药品推荐。建议您咨询药师或就医。",
@@ -69,13 +94,14 @@ async def recommend_node(
             "node_events": [{"node": "recommend", "count": 0}],
         }
 
-    # Build LLM prompt for ranking
+    # ── 4. LLM 排序推荐 ──
+    # 把候选药品信息发给 LLM，让它挑最好的 1-3 个
     drug_list = [
         {
             "id": d.id,
             "generic_name": d.generic_name,
-            "brand_names": d.brand_names,
-            "indication": d.indication_summary,
+            "brand_names": d.brand_names,           # 商品名（如芬必得、美林）
+            "indication": d.indication_summary,     # 适应症
             "active_ingredients": d.active_ingredients,
             "dosage_form": d.dosage_form,
         }
@@ -102,7 +128,7 @@ async def recommend_node(
             max_tokens=1024,
         )
     except Exception:
-        # Fallback: return top 3 candidates sorted by name
+        # LLM 失败 → 简单取前 3 个候选药品，score 统一 0.5
         output = RecommendOutput(
             recommendations=[
                 RecommendationItem(
@@ -125,10 +151,9 @@ async def recommend_node(
         for r in output.recommendations
     ]
 
-    # Build response
+    # ── 5. 生成自然语言回复 ──
     lines = ["根据您的情况，为您推荐以下药品：\n"]
     for i, r in enumerate(recommendations, 1):
-        # Find brand names
         drug = next((d for d in candidates if d.id == r["drug_id"]), None)
         brands = f"（{'、'.join(drug.brand_names)}）" if drug and drug.brand_names else ""
         lines.append(f"{i}. **{r['generic_name']}**{brands}")

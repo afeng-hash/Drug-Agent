@@ -1,4 +1,17 @@
-"""Graph builder — assembles the LangGraph state machine."""
+"""
+Graph builder — 组装 LangGraph 状态机。
+
+这是整个系统的"大脑骨架"——定义节点、边、条件路由，把所有组件串联起来。
+
+流程图：
+  intake ──▶ dispatcher ──▶ consult ──▶ safety_check ──▶ recommend ──▶ inventory ──▶ end
+                 │              │            │
+                 ├── explain ───┤            │
+                 ├── recommend ─┤            │
+                 └── end ───────┘            │
+                                │            │
+                        (ask) → end     (BLOCK) → end
+"""
 
 from functools import partial
 
@@ -37,104 +50,147 @@ def build_graph(
     retriever: DrugManualRetriever,
     max_consult_rounds: int = 6,
 ) -> StateGraph:
-    """Build and compile the LangGraph state machine.
+    """构建并编译 LangGraph 状态机。
+
+    在 FastAPI lifespan 的 startup 阶段调用一次。
+    返回的 compiled graph 挂到 app.state.graph 上，每次请求时复用。
 
     Args:
-        llm_client: LLM client instance.
-        rule_engine: Rule engine with registered rules.
-        drug_repo_factory: Callable that returns DrugRepository (per-session DB).
-        inventory_repo_factory: Callable that returns InventoryRepository.
-        session_repo_factory: Callable that returns SessionRepository.
-        safety_log_repo_factory: Callable that returns SafetyLogRepository.
-        retriever: RAG retriever instance.
-        max_consult_rounds: Max consult follow-up rounds.
+        llm_client:          LLM 客户端（通义千问）
+        rule_engine:         安全规则引擎（已注册所有规则）
+        drug_repo_factory:   药品仓库工厂（每次调用创建新 DB 会话）
+        inventory_repo_factory: 库存仓库工厂
+        session_repo_factory:   会话仓库工厂
+        safety_log_repo_factory: 安全日志仓库工厂
+        retriever:           Milvus 药品说明书检索器
+        max_consult_rounds:  问诊最多追问轮数，超过此数强制进入推荐
 
     Returns:
-        Compiled LangGraph StateGraph.
+        编译好的 LangGraph 图（可直接调用 .astream_events()）
     """
     graph = StateGraph(ConversationState)
 
-    # ── Add nodes ──
-    # Nodes are async functions; LangGraph handles the async execution.
-    # We use partial to inject dependencies via closure.
+    # ── 添加节点 ──────────────────────────────────────────
+    # 每个节点是一个 async 函数，接收 state，返回部分更新的 dict
+    # 用 partial 把不可序列化的依赖（LLM client 等）通过闭包注入
+
     graph.add_node("intake", intake_node)
+    """预处理节点：更新 phase，不做复杂逻辑"""
+
     graph.add_node("dispatcher", partial(dispatcher_node, llm_client=llm_client))
+    """路由分发节点：LLM 分析用户意图，决定下一步走哪个节点"""
+
     graph.add_node(
         "consult",
         partial(consult_node, llm_client=llm_client, max_rounds=max_consult_rounds),
     )
+    """症状问诊节点：多轮追问，收集症状槽位"""
+
     graph.add_node(
         "safety_check",
         partial(safety_check_node, rule_engine=rule_engine),
     )
-    # recommend, explain, inventory, end need DB sessions — we use factories
+    """安全筛查节点：规则引擎检查用药禁忌"""
+
+    # recommend / explain / inventory / end 需要每次新开 DB 会话，
+    # 所以用工厂模式（_make_* 闭包），而不是直接传 repo 实例
     graph.add_node(
         "recommend",
         _make_recommend(llm_client, drug_repo_factory),
     )
+    """药品推荐节点：LLM 匹配症状 → 药品"""
+
     graph.add_node(
         "explain",
         _make_explain(llm_client, drug_repo_factory, retriever),
     )
+    """药品解释节点：DB + RAG → 格式化的药品说明书"""
+
     graph.add_node(
         "inventory",
         _make_inventory(inventory_repo_factory, drug_repo_factory),
     )
+    """库存节点：查询推荐药品的库存和价格"""
+
     graph.add_node(
         "end",
         _make_end(session_repo_factory, safety_log_repo_factory),
     )
+    """结束节点：持久化消息、记录安全日志"""
 
-    # ── Add edges ──
+    # ── 添加边 ──────────────────────────────────────────
+
+    # 入口 → intake
     graph.set_entry_point("intake")
+
+    # intake → dispatcher（无条件）
     graph.add_edge("intake", "dispatcher")
 
-    # Dispatcher: conditional routing
+    # dispatcher → 4 路条件分支
     graph.add_conditional_edges(
         "dispatcher",
-        route_after_dispatcher,
+        route_after_dispatcher,           # 条件函数：读 dispatcher_result.route
         {
-            "consult": "consult",
-            "explain": "explain",
-            "recommend": "recommend",
-            "end": "end",
+            "consult": "consult",          # 症状问诊
+            "explain": "explain",          # 药品解释
+            "recommend": "recommend",      # 直接推荐
+            "end": "end",                  # 结束
         },
     )
 
-    # Consult: if done → safety_check; otherwise → end (wait for user)
+    # consult → 2 路条件分支
     graph.add_conditional_edges(
         "consult",
-        route_after_consult,
+        route_after_consult,              # 条件函数：读 consult_next_action
         {
-            "safety_check": "safety_check",
-            "end": "end",
+            "safety_check": "safety_check",  # done → 进入安全检查
+            "end": "end",                    # ask → 等待用户下一轮输入
         },
     )
 
-    # Safety check: BLOCK → end; PASS/FILTER → recommend
+    # safety_check → 2 路条件分支
     graph.add_conditional_edges(
         "safety_check",
-        route_after_safety,
+        route_after_safety,               # 条件函数：读 safety_result.verdict
         {
-            "recommend": "recommend",
-            "end": "end",
+            "recommend": "recommend",      # PASS / FILTER → 继续推荐
+            "end": "end",                  # BLOCK → 终止，返回警告
         },
     )
 
-    # Linear tail: recommend → inventory → end
+    # 推荐链（线性）：recommend → inventory → end
     graph.add_edge("recommend", "inventory")
     graph.add_edge("inventory", "end")
 
-    # Explain and end are terminal (wait for next turn)
+    # explain → end（解释完就结束本轮）
     graph.add_edge("explain", "end")
+
+    # end → 图结束（触发 .astream_events() 停止）
     graph.add_edge("end", END)
 
+    # ── 编译 ──
     return graph.compile()
 
 
-# ── Node factory wrappers (closure injection of per-request DB sessions) ──
+# ──────────────────────────────────────────────────────────
+# 节点工厂函数（闭包注入 DB 仓库）
+#
+# 为什么需要工厂？
+#   LangGraph 的节点函数签名是 (state) → dict。但 recommend/explain/
+#   inventory/end 节点需要 DB session。如果直接把 repo 传给节点，
+#   repo 绑定的 session 会在整个应用生命周期内一直存在（连接池泄露）。
+#
+#   factory 模式：每次节点被调用时，通过工厂函数新开一个 DB 会话，
+#   用完即关。这样每个 Graph run 都有独立的短生命周期 DB session。
+# ──────────────────────────────────────────────────────────
+
 
 def _make_recommend(llm_client, drug_repo_factory):
+    """创建 recommend 节点的闭包。
+
+    调用时机：每次 Graph 运行到 recommend 节点时。
+    内部逻辑：打开 DB 会话 → 查药品 → LLM 匹配 → 返回推荐 → 关闭会话。
+    """
     async def wrapped(state: ConversationState) -> dict:
         async with drug_repo_factory() as drug_repo:
             return await recommend_node(
@@ -144,6 +200,11 @@ def _make_recommend(llm_client, drug_repo_factory):
 
 
 def _make_explain(llm_client, drug_repo_factory, retriever):
+    """创建 explain 节点的闭包。
+
+    调用时机：Dispatcher 判定用户在问某个药品时。
+    内部逻辑：DB 查药品基本信息 + Milvus 向量检索说明书 → LLM 格式化解释。
+    """
     async def wrapped(state: ConversationState) -> dict:
         async with drug_repo_factory() as drug_repo:
             return await explain_node(
@@ -156,6 +217,11 @@ def _make_explain(llm_client, drug_repo_factory, retriever):
 
 
 def _make_inventory(inventory_repo_factory, drug_repo_factory):
+    """创建 inventory 节点的闭包。
+
+    调用时机：recommend 节点之后。
+    内部逻辑：根据推荐药品的 drug_id 查库存表 → 格式化库存信息 → 追加到 response。
+    """
     async def wrapped(state: ConversationState) -> dict:
         async with inventory_repo_factory() as inv_repo, drug_repo_factory() as drug_repo:
             return await inventory_node(
@@ -167,6 +233,11 @@ def _make_inventory(inventory_repo_factory, drug_repo_factory):
 
 
 def _make_end(session_repo_factory, safety_log_repo_factory):
+    """创建 end 节点的闭包。
+
+    调用时机：每个 turn 的最后一步。
+    内部逻辑：保存 AI 回复到 messages 表 + 记录安全日志到 safety_logs 表。
+    """
     async def wrapped(state: ConversationState) -> dict:
         async with session_repo_factory() as session_repo, safety_log_repo_factory() as safety_log_repo:
             return await end_node(
