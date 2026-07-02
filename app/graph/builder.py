@@ -96,9 +96,9 @@ def build_graph(
     # 所以用工厂模式（_make_* 闭包），而不是直接传 repo 实例
     graph.add_node(
         "recommend",
-        _make_recommend(llm_client, drug_repo_factory),
+        _make_recommend(llm_client, drug_repo_factory, retriever),
     )
-    """药品推荐节点：LLM 匹配症状 → 药品"""
+    """药品推荐节点：LLM 匹配症状 → 药品 + RAG 说明书"""
 
     graph.add_node(
         "explain",
@@ -185,16 +185,19 @@ def build_graph(
 # ──────────────────────────────────────────────────────────
 
 
-def _make_recommend(llm_client, drug_repo_factory):
+def _make_recommend(llm_client, drug_repo_factory, retriever):
     """创建 recommend 节点的闭包。
 
     调用时机：每次 Graph 运行到 recommend 节点时。
-    内部逻辑：打开 DB 会话 → 查药品 → LLM 匹配 → 返回推荐 → 关闭会话。
+    内部逻辑：打开 DB 会话 → 查药品 → LLM 排序 → RAG 查说明书 → 返回推荐 → 关闭会话。
     """
     async def wrapped(state: ConversationState) -> dict:
         async with drug_repo_factory() as drug_repo:
             return await recommend_node(
-                state, llm_client=llm_client, drug_repo=drug_repo
+                state,
+                llm_client=llm_client,
+                drug_repo=drug_repo,
+                retriever=retriever,
             )
     return wrapped
 
