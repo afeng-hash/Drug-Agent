@@ -1,0 +1,18 @@
+[
+  {"drug_generic_name": "布洛芬", "product_name": "芬必得布洛芬缓释胶囊", "manufacturer": "中美天津史克", "specification": "0.3g×20粒", "stock_quantity": 50, "price": 18.50, "shelf_location": "A区-2排-3层", "is_available": true},
+  {"drug_generic_name": "布洛芬", "product_name": "美林布洛芬混悬液", "manufacturer": "上海强生", "specification": "100ml:2g", "stock_quantity": 30, "price": 25.80, "shelf_location": "A区-2排-4层", "is_available": true},
+  {"drug_generic_name": "布洛芬", "product_name": "布洛芬片", "manufacturer": "石药集团", "specification": "0.2g×24片", "stock_quantity": 100, "price": 8.50, "shelf_location": "A区-2排-2层", "is_available": true},
+  {"drug_generic_name": "对乙酰氨基酚", "product_name": "泰诺对乙酰氨基酚片", "manufacturer": "上海强生", "specification": "0.5g×10片", "stock_quantity": 80, "price": 12.00, "shelf_location": "A区-3排-1层", "is_available": true},
+  {"drug_generic_name": "对乙酰氨基酚", "product_name": "扑热息痛片", "manufacturer": "东北制药", "specification": "0.3g×100片", "stock_quantity": 200, "price": 5.50, "shelf_location": "A区-3排-2层", "is_available": true},
+  {"drug_generic_name": "复方氨酚烷胺", "product_name": "快克复方氨酚烷胺胶囊", "manufacturer": "浙江康恩贝", "specification": "12粒/盒", "stock_quantity": 60, "price": 16.80, "shelf_location": "B区-1排-1层", "is_available": true},
+  {"drug_generic_name": "复方氨酚烷胺", "product_name": "感康复方氨酚烷胺片", "manufacturer": "吉林省吴太", "specification": "12片/盒", "stock_quantity": 45, "price": 14.50, "shelf_location": "B区-1排-2层", "is_available": true},
+  {"drug_generic_name": "酚麻美敏", "product_name": "泰诺感冒片", "manufacturer": "上海强生", "specification": "10片/盒", "stock_quantity": 40, "price": 19.80, "shelf_location": "B区-1排-3层", "is_available": true},
+  {"drug_generic_name": "盐酸伪麻黄碱", "product_name": "新康泰克盐酸伪麻黄碱胶囊", "manufacturer": "中美天津史克", "specification": "10粒/盒", "stock_quantity": 35, "price": 22.00, "shelf_location": "B区-2排-1层", "is_available": true},
+  {"drug_generic_name": "氢溴酸右美沙芬", "product_name": "惠菲宁右美沙芬糖浆", "manufacturer": "惠氏", "specification": "120ml/瓶", "stock_quantity": 20, "price": 28.00, "shelf_location": "B区-2排-2层", "is_available": true},
+  {"drug_generic_name": "马来酸氯苯那敏", "product_name": "扑尔敏片", "manufacturer": "天津力生", "specification": "4mg×100片", "stock_quantity": 150, "price": 3.50, "shelf_location": "B区-2排-3层", "is_available": true},
+  {"drug_generic_name": "连花清瘟胶囊", "product_name": "连花清瘟胶囊", "manufacturer": "以岭药业", "specification": "0.35g×36粒", "stock_quantity": 100, "price": 29.80, "shelf_location": "C区-1排-1层", "is_available": true},
+  {"drug_generic_name": "板蓝根颗粒", "product_name": "白云山板蓝根颗粒", "manufacturer": "广州白云山", "specification": "10g×20袋", "stock_quantity": 200, "price": 16.00, "shelf_location": "C区-1排-2层", "is_available": true},
+  {"drug_generic_name": "维C银翘片", "product_name": "维C银翘片", "manufacturer": "贵州百灵", "specification": "24片/盒", "stock_quantity": 80, "price": 9.80, "shelf_location": "C区-1排-3层", "is_available": true},
+  {"drug_generic_name": "氨咖黄敏", "product_name": "速效感冒胶囊", "manufacturer": "江西药都", "specification": "10粒/板", "stock_quantity": 120, "price": 7.50, "shelf_location": "A区-4排-1层", "is_available": true},
+  {"drug_generic_name": "正柴胡饮颗粒", "product_name": "正柴胡饮颗粒", "manufacturer": "同仁堂", "specification": "10g×10袋", "stock_quantity": 50, "price": 18.00, "shelf_location": "C区-2排-1层", "is_available": true}
+]
