@@ -41,10 +41,12 @@ async def test_graph_compiles():
     from unittest.mock import MagicMock
 
     from app.graph.builder import build_graph
+    from app.scorer.pipeline import ScoringPipeline
 
     mock_llm = AsyncMock()
     mock_rule_engine = MagicMock()
     mock_retriever = MagicMock()
+    mock_scoring_pipeline = MagicMock(spec=ScoringPipeline)
 
     # Mock repo factories
     mock_drug_factory = MagicMock()
@@ -54,6 +56,7 @@ async def test_graph_compiles():
     mock_inv_factory = MagicMock()
     mock_session_factory = MagicMock()
     mock_safety_factory = MagicMock()
+    mock_weight_factory = MagicMock()
 
     graph = build_graph(
         llm_client=mock_llm,
@@ -62,7 +65,9 @@ async def test_graph_compiles():
         inventory_repo_factory=mock_inv_factory,
         session_repo_factory=mock_session_factory,
         safety_log_repo_factory=mock_safety_factory,
+        weight_repo_factory=mock_weight_factory,
         retriever=mock_retriever,
+        scoring_pipeline=mock_scoring_pipeline,
     )
 
     assert graph is not None

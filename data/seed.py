@@ -68,6 +68,45 @@ async def seed():
         await db.commit()
         print(f"✅ Inserted {count} inventory items")
 
+    # ── Weight Config (default) ──
+    async with session_factory() as db:
+        from app.db.models import WeightConfig
+        from sqlalchemy import select as sa_select
+
+        existing = await db.execute(
+            sa_select(WeightConfig).where(WeightConfig.version == "v1.0.0")
+        )
+        if not existing.scalar_one_or_none():
+            config = WeightConfig(
+                version="v1.0.0",
+                policy="balanced",
+                weights={
+                    "symptom_match": 0.30,
+                    "safety": 0.25,
+                    "age_suitability": 0.20,
+                    "otc_safety_level": 0.10,
+                    "ingredient_coverage": 0.10,
+                    "evidence_quality": 0.05,
+                },
+                feature_defaults={
+                    "symptom_match": 0.0,
+                    "safety": 1.0,
+                    "age_suitability": 0.5,
+                    "otc_safety_level": 0.7,
+                    "ingredient_coverage": 0.0,
+                    "evidence_quality": 0.5,
+                },
+                safety_block_threshold=0.2,
+                is_active=True,
+                description="初始默认权重：均衡推荐策略",
+                changed_by="seed",
+            )
+            db.add(config)
+            await db.commit()
+            print("✅ Inserted default weight config v1.0.0")
+        else:
+            print("ℹ️  Weight config v1.0.0 already exists")
+
     # ── RAG Documents ──
     llm_client = LLMClient(settings)
     retriever = DrugManualRetriever(settings, llm_client)

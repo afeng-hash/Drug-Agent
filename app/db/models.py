@@ -266,3 +266,56 @@ class SafetyLog(Base):
         default=lambda: datetime.now(timezone.utc),
     )
     """日志创建时间"""
+
+
+# ────────────────────────────────────────────────────────────
+# 权重配置表
+# ────────────────────────────────────────────────────────────
+
+class WeightConfig(Base):
+    """药品评分权重配置表。
+
+    每行代表一个权重版本。同时只有一个版本 is_active=True。
+    支持 A/B 测试：通过 ab_group + ab_ratio 按 session 分桶路由。
+    """
+
+    __tablename__ = "weights_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    """自增主键"""
+
+    version: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
+    """语义版本号，如 'v3.2.1'，唯一索引"""
+
+    policy: Mapped[str] = mapped_column(String(50), nullable=False, default="balanced")
+    """策略名：'balanced' | 'safety_first'"""
+
+    weights: Mapped[dict] = mapped_column(JSON, nullable=False)
+    """权重 JSON：{"symptom_match": 0.30, "safety": 0.25, "age_suitability": 0.20, ...}"""
+
+    feature_defaults: Mapped[dict] = mapped_column(JSON, default=dict)
+    """特征默认值 JSON：{"symptom_match": 0.0, "safety": 1.0, ...}"""
+
+    safety_block_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.2)
+    """安全排除阈值：safety < 此值 → 药品不推荐"""
+
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    """是否为当前激活版本"""
+
+    ab_group: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    """A/B 分组标识：'A' / 'B' / None（全量）"""
+
+    ab_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """A/B 流量比例：0.0~1.0"""
+
+    description: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    """变更说明"""
+
+    changed_by: Mapped[str] = mapped_column(String(100), nullable=False, default="system")
+    """操作人"""
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    """创建时间"""

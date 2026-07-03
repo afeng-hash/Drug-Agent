@@ -28,11 +28,13 @@ from app.db.repositories.drug import DrugRepository
 from app.db.repositories.inventory import InventoryRepository
 from app.db.repositories.safety_log import SafetyLogRepository
 from app.db.repositories.session import SessionRepository
+from app.db.repositories.weight_config import WeightConfigRepository
 from app.graph.builder import build_graph
 from app.llm.client import LLMClient
 from app.rag.retriever import DrugManualRetriever
 from app.rules.definitions import register_all_rules
 from app.rules.engine import RuleEngine
+from app.scorer.pipeline import ScoringPipeline
 
 
 @asynccontextmanager
@@ -80,6 +82,10 @@ async def lifespan(app: FastAPI):
 
     app.state.retriever = retriever
 
+    # ── ScoringPipeline（一次创建，全应用复用）──
+    scoring_pipeline = ScoringPipeline()
+    app.state.scoring_pipeline = scoring_pipeline
+
     # ── Repository 工厂 ──
     # 每个 Graph run 会多次调用这些工厂，每次调用都会新开一个 DB session
     # 用完即关（参见 _RepoContext），避免连接池泄露
@@ -95,6 +101,9 @@ async def lifespan(app: FastAPI):
     def safety_log_repo_factory():
         return _repo_context(SafetyLogRepository)
 
+    def weight_repo_factory():
+        return _repo_context(WeightConfigRepository)
+
     # ── 构建 LangGraph ──
     graph = build_graph(
         llm_client=llm_client,
@@ -103,7 +112,9 @@ async def lifespan(app: FastAPI):
         inventory_repo_factory=inventory_repo_factory,
         session_repo_factory=session_repo_factory,
         safety_log_repo_factory=safety_log_repo_factory,
+        weight_repo_factory=weight_repo_factory,
         retriever=retriever,
+        scoring_pipeline=scoring_pipeline,
         max_consult_rounds=settings.max_consult_rounds,
     )
     app.state.graph = graph

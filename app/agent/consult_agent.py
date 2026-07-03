@@ -64,6 +64,7 @@ async def run_consult(
     # 统计已进行的问诊轮数（assistant 发言次数）
     consult_rounds = sum(
         1 for m in messages
+        # todo
         if m.get("role") == "assistant" and "问" not in m.get("content", "")
     )
 
