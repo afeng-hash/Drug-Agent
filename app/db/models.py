@@ -184,6 +184,16 @@ class Session(Base):
     )
     """最后更新时间（每次添加消息时更新）"""
 
+    state_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    """跨 turn 结构化状态快照。
+
+    每个 turn 结束时由 end_node 写入，下个 turn 开始时由 chat.py 读取并恢复到 state。
+    存储内容：consult_slots, phase, previous_phase, consult_rounds,
+             consult_summary, safety_result, recommendations, dispatcher_result
+
+    为 None 表示新会话的首个 turn（还没有任何结构化状态需要恢复）。
+    """
+
     # ── 关系 ──
     messages: Mapped[list["Message"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"

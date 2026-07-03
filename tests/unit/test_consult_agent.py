@@ -127,7 +127,10 @@ async def test_consult_forces_done_at_max_rounds():
         {"role": "assistant", "content": "吃过药吗？"},
     ]
 
-    result = await run_consult(llm_client, messages, current_slots, max_rounds=6)
+    # 显式传入 consult_rounds=6（已达到上限），不再依赖从 messages 内容反推轮数
+    result = await run_consult(
+        llm_client, messages, current_slots, max_rounds=6, consult_rounds=6,
+    )
     assert result.next_action == "done"
     # LLM should NOT have been called
     llm_client.generate_structured.assert_not_called()

@@ -39,6 +39,7 @@ async def consult_node(
     messages = state.get("messages", [])
     slots = state.get("consult_slots", {})
     dispatcher_params = state.get("dispatcher_result", {}).get("params", {})
+    consult_rounds = state.get("consult_rounds", 0)
 
     # 如果 Dispatcher 标记了 reset_slots（用户切换了症状描述），清空旧槽位
     reset_slots = dispatcher_params.get("reset_slots", False)
@@ -54,6 +55,7 @@ async def consult_node(
             "allergies": [],
             "other_symptoms": [],
         }
+        consult_rounds = 0  # 新症状 → 轮数从头算
 
     # 委托给 Consult Agent（核心逻辑在 app/agent/consult_agent.py）
     result = await run_consult(
@@ -61,17 +63,20 @@ async def consult_node(
         messages=messages,
         current_slots=slots,
         max_rounds=max_rounds,
+        consult_rounds=consult_rounds,
     )
 
     return {
         "consult_slots": result.updated_slots,
         "consult_next_action": result.next_action,  # "ask" 或 "done"
         "consult_summary": result.summary,
+        "consult_rounds": consult_rounds + 1,       # 本轮追问完成，递增
         "response": result.response,
         "phase": "consulting",
         "node_events": [{
             "node": "consult",
             "next_action": result.next_action,
             "summary": result.summary,
+            "round": consult_rounds + 1,
         }],
     }

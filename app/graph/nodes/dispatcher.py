@@ -69,14 +69,18 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
     current_phase = state.get("phase", "intake")
     previous_phase = state.get("previous_phase")
 
+    # 取最近 N 条对话历史作为上下文（帮助 LLM 理解对话进展）
+    recent_n = 8  # 最近 4 轮对话
+    recent_messages = messages[-recent_n:] if len(messages) > recent_n else messages
+
     context = {
         "current_phase": current_phase,
         "previous_phase": previous_phase,
         "collected_slots_summary": _summarize_slots(slots),  # 人类可读的症状摘要
+        "recent_conversation": _format_recent_messages(recent_messages),
         "user_message": latest_user,
     }
 
-    #todo
     prompt_messages = [
         {"role": "system", "content": DISPATCHER_PROMPT},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
@@ -175,3 +179,30 @@ def _summarize_slots(slots: dict) -> str:
         parts.append(f"过敏史: {', '.join(allergies)}")
 
     return "；".join(parts) if parts else "暂无已收集的症状信息"
+
+
+def _format_recent_messages(messages: list[dict]) -> str:
+    """将最近 N 条对话历史格式化为人类可读的字符串，给 LLM 做上下文。
+
+    示例输出：
+      "用户: 我头疼发烧两天了\n系统: 请问体温多少度？\n用户: 38度"
+
+    Args:
+        messages: 标准化后的消息列表 [{"role": "...", "content": "..."}]
+
+    Returns:
+        格式化的对话历史字符串
+    """
+    if not messages:
+        return "（无对话历史）"
+
+    lines = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "user":
+            lines.append(f"用户: {content}")
+        elif role == "assistant":
+            lines.append(f"系统: {content}")
+        # system 消息不展示（通常是 prompt）
+    return "\n".join(lines) if lines else "（无对话历史）"

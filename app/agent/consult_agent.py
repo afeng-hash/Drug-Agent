@@ -39,34 +39,29 @@ async def run_consult(
     messages: list[dict],
     current_slots: dict,
     max_rounds: int = 6,
+    consult_rounds: int = 0,
 ) -> ConsultResult:
     """执行一轮症状问诊。
 
     这个函数由 Consult 节点（app/graph/nodes/consult.py）调用。
     每轮：
-      1. 统计已追问的轮数（assistant 消息数）
+      1. 使用 state 中显式追踪的 consult_rounds（不再从消息内容反推）
       2. 把当前 slots 和轮数作为上下文发给 LLM
       3. LLM 分析用户最新消息，更新 slots，决定下一步动作
       4. 如果已达最大轮数，强制 done
 
     Args:
-        llm_client:    LLM 客户端
-        messages:      完整对话历史（[{"role": "user"|"assistant", "content": "..."}]）
-        current_slots: 当前已收集的症状槽位
-        max_rounds:    最大追问轮数。超过此数不管是否充分都强制 done
+        llm_client:     LLM 客户端
+        messages:       完整对话历史（[{"role": "user"|"assistant", "content": "..."}]）
+        current_slots:  当前已收集的症状槽位
+        max_rounds:     最大追问轮数。超过此数不管是否充分都强制 done
+        consult_rounds: 当前已追问轮数（由 consult_node 从 state 中传入并递增）
 
     Returns:
         ConsultResult：更新后的槽位、回复文本、下一步动作、症状摘要
     """
     # 标准化消息格式（LangGraph 可能把 dict 转成了 LangChain 对象）
     messages = normalize_messages(messages)
-
-    # 统计已进行的问诊轮数（assistant 发言次数）
-    consult_rounds = sum(
-        1 for m in messages
-        # todo
-        if m.get("role") == "assistant" and "问" not in m.get("content", "")
-    )
 
     # ── 如果已达最大追问轮数，强制结束 ──
     if consult_rounds >= max_rounds:

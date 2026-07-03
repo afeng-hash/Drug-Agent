@@ -74,6 +74,10 @@ async def chat(
         if session.status != "active":
             raise HTTPException(status_code=400, detail=f"Session is {session.status}")
 
+        # 1.1b 提取上一 turn 的结构化状态快照（如有）
+        # 新的 session 首个 turn 时 state_snapshot 为 None → initial_state 使用默认空值
+        state_snapshot = session.state_snapshot if session.state_snapshot else None
+
         # 1.2 保存用户消息到数据库
         await session_repo.add_message(
             session_id=session_id,
@@ -99,7 +103,11 @@ async def chat(
     # ═══════════════════════════════════════════════════════
     # 阶段 2：初始化 state 并获取 graph
     # ═══════════════════════════════════════════════════════
-    state = initial_state(session_id=session_id, messages=messages_history)
+    state = initial_state(
+        session_id=session_id,
+        messages=messages_history,
+        snapshot=state_snapshot,
+    )
     graph = app_state.graph
 
     # ═══════════════════════════════════════════════════════

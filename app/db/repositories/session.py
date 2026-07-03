@@ -136,3 +136,24 @@ class SessionRepository:
         # 刷新 updated_at，延长过期倒计时
         session.updated_at = datetime.now(timezone.utc)
         await self.db.commit()
+
+    async def update_snapshot(self, session_id: str, snapshot: dict) -> None:
+        """持久化结构化状态快照，供下个 turn 恢复。
+
+        在 end_node 中调用，保存 consult_slots、phase、consult_rounds 等
+        跨 turn 需要存活的结构化状态。
+
+        Args:
+            session_id: 会话 UUID
+            snapshot:   状态快照 dict
+
+        Raises:
+            ValueError: 如果 session 不存在
+        """
+        session = await self.get(session_id)
+        if session is None:
+            raise ValueError(f"Session {session_id} not found")
+
+        session.state_snapshot = snapshot
+        session.updated_at = datetime.now(timezone.utc)
+        await self.db.commit()

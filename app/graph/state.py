@@ -170,6 +170,18 @@ class ConversationState(TypedDict):
     消费：route_after_consult() 决定走 safety_check 还是 end
     """
 
+    consult_rounds: int
+    """【问诊轮数】当前 consult 流程中系统已追问的轮数。
+
+    每轮 consult_node 执行后 +1。用于：
+      - Consult Agent 判断是否达到 max_rounds 上限
+      - 替代从 messages 内容反推轮数的不可靠 hack
+
+    重置条件：
+      - Dispatcher 判定用户切换了症状主题（reset_slots=true），consult_node 重置为 0
+      - 新 session 首次对话时自然为 0
+    """
+
     consult_summary: str
     """【症状摘要】Consult 判定 done 时生成的一句话自然语言摘要。
 
@@ -342,7 +354,11 @@ def normalize_messages(messages: list) -> list[dict]:
     return result
 
 
-def initial_state(session_id: str, messages: list[dict] | None = None) -> ConversationState:
+def initial_state(
+    session_id: str,
+    messages: list[dict] | None = None,
+    snapshot: dict | None = None,
+) -> ConversationState:
     """创建一个新的 turn 初始状态。
 
     每次用户发消息时调用，用 session_id 和历史 messages 初始化 state。
@@ -352,14 +368,15 @@ def initial_state(session_id: str, messages: list[dict] | None = None) -> Conver
         session_id: 会话 UUID
         messages:  该 session 的历史对话（从 DB 加载），首次对话传 []
                    格式为 [{"role": "user", "content": "..."}, ...]
+        snapshot:  上一 turn 结束时保存的结构化状态快照（从 DB state_snapshot 字段加载）。
+                   包含 consult_slots, phase, consult_rounds 等字段。
+                   首次对话时为 None → 使用默认空值。
 
     Returns:
-        填充了默认值的 ConversationState，其中：
-          - consult_slots 全是空值（每个 turn 开始时从零收集）
-          - phase="intake"（由 Intake 节点修改为实际阶段）
-          - 其他字段为空默认值
+        填充了默认值的 ConversationState。如果提供了 snapshot，会用快照中的值覆盖默认空值，
+        从而让结构化状态（slots, phase, rounds 等）跨 turn 存活。
     """
-    return ConversationState(
+    state = ConversationState(
         session_id=session_id,
         messages=messages or [],
         phase="intake",
@@ -377,9 +394,30 @@ def initial_state(session_id: str, messages: list[dict] | None = None) -> Conver
         },
         dispatcher_result={},
         consult_next_action="ask",
+        consult_rounds=0,
         consult_summary="",
         safety_result=None,
         recommendations=[],
         response="",
         node_events=[],
     )
+
+    # ── 从快照恢复结构化状态 ──
+    # messages 已经从 DB 独立加载，不需要从快照恢复。
+    # 其他字段如果快照中有就用快照的值覆盖默认值。
+    if snapshot:
+        _restorable_keys = (
+            "consult_slots",
+            "phase",
+            "previous_phase",
+            "consult_rounds",
+            "consult_summary",
+            "safety_result",
+            "recommendations",
+            "dispatcher_result",
+        )
+        for key in _restorable_keys:
+            if key in snapshot:
+                state[key] = snapshot[key]
+
+    return state

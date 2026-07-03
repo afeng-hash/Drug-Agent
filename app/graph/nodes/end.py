@@ -60,6 +60,25 @@ async def end_node(
         except Exception:
             pass  # 安全日志写入失败不阻塞主流程
 
+    # ── 3. 持久化结构化状态快照 ──
+    # 将跨 turn 需要存活的状态（slots, phase, rounds 等）写入 DB，
+    # 下个 HTTP 请求时由 chat.py 读取并恢复到 state。
+    if session_id:
+        try:
+            state_snapshot = {
+                "consult_slots": state.get("consult_slots", {}),
+                "phase": state.get("phase"),
+                "previous_phase": state.get("previous_phase"),
+                "consult_rounds": state.get("consult_rounds", 0),
+                "consult_summary": state.get("consult_summary", ""),
+                "safety_result": state.get("safety_result"),
+                "recommendations": state.get("recommendations", []),
+                "dispatcher_result": state.get("dispatcher_result", {}),
+            }
+            await session_repo.update_snapshot(session_id, state_snapshot)
+        except Exception:
+            pass  # 快照写入失败不阻塞主流程
+
     return {
         "phase": "ended",
         "node_events": [{"node": "end", "status": "ok"}],
