@@ -60,16 +60,18 @@ async def recommend_node(
     weight_repo: WeightConfigRepository,
     retriever: DrugManualRetriever,
     scoring_pipeline: ScoringPipeline,
+    drug_graph_repo=None,
 ) -> dict:
     """执行药品推荐：评分排序 + RAG 说明 + LLM 文案。
 
     Args:
-        state:            当前对话状态
-        llm_client:       LLM 客户端（仅用于生成推荐理由文案）
-        drug_repo:        药品仓库（已绑定 DB session）
-        weight_repo:      权重配置仓库（已绑定 DB session）
-        retriever:        Milvus 说明书检索器
-        scoring_pipeline: 评分排序管线
+        state:             当前对话状态
+        llm_client:        LLM 客户端（仅用于生成推荐理由文案）
+        drug_repo:         药品仓库（已绑定 DB session，PG 降级备用）
+        weight_repo:       权重配置仓库（已绑定 DB session）
+        retriever:         Milvus 说明书检索器
+        scoring_pipeline:  评分排序管线
+        drug_graph_repo:   Neo4j 图谱仓库（主查询路径，None 时降级到 PG）
 
     Returns:
         state 更新 dict。
@@ -80,17 +82,30 @@ async def recommend_node(
     safety_result = state.get("safety_result") or {}
     excluded_drugs = safety_result.get("excluded_drugs", [])
 
-    # ── 1. 提取症状名称 ──
+    # ── 1. 提取症状名称并分配权重 ──
+    # 主诉症状 weight=1.0，附加症状 weight=0.5
     symptoms = slots.get("symptoms", [])
-    symptom_names = _extract_symptom_names(symptoms)
+    primary_names = _extract_symptom_names(symptoms)
+    secondary_names = _extract_symptom_names(slots.get("other_symptoms", []))
 
-    # ── 2. DB 查候选药品 ──
-    drugs = await drug_repo.find_by_symptoms(symptom_names, category="感冒退烧")
-    if not drugs:
-        drugs = await drug_repo.list_all(category="感冒退烧")
+    symptom_weights = (
+        [{"name": n, "weight": 1.0} for n in primary_names]
+        + [{"name": n, "weight": 0.5} for n in secondary_names]
+    )
+    symptom_names = primary_names + secondary_names
+
+    # ── 2. 查询候选药品（Neo4j 优先 → PG ILIKE 降级）──
+    # todo
+    candidates = await _fetch_candidates(
+        drug_graph_repo=drug_graph_repo,
+        drug_repo=drug_repo,
+        symptom_weights=symptom_weights,
+        symptom_names=symptom_names,
+        category="感冒退烧",
+    )
 
     # ── 3. 排除安全规则过滤的药品 ──
-    candidates = [d for d in drugs if d.generic_name not in excluded_drugs]
+    candidates = [d for d in candidates if d.generic_name not in excluded_drugs]
     if not candidates:
         return {
             "recommendations": [],
@@ -169,6 +184,53 @@ def _extract_symptom_names(symptoms: list) -> list[str]:
         s.get("name", s) if isinstance(s, dict) else str(s)
         for s in symptoms
     ]
+
+
+async def _fetch_candidates(
+    drug_graph_repo,
+    drug_repo: DrugRepository,
+    symptom_weights: list[dict],
+    symptom_names: list[str],
+    category: str,
+) -> list:
+    """查询候选药品：Neo4j 图查询优先，PG ILIKE 降级。
+
+    Neo4j 返回排好序的药品名 → 从 PG 补全 Drug ORM 对象。
+    降级时直接用 PG ILIKE 查询。
+
+    Args:
+        drug_graph_repo: DrugGraphRepository or None
+        drug_repo:       PG DrugRepository (always available)
+        symptom_weights: [{name, weight}, ...] for Neo4j scoring
+        symptom_names:   plain name list for PG ILIKE fallback
+        category:        drug category filter
+
+    Returns:
+        List of Drug ORM objects, ordered by relevance (Neo4j score or PG ILIKE order)
+    """
+    # ── 优先：Neo4j 图查询 ──
+    if drug_graph_repo is not None:
+        try:
+            kg_candidates = await drug_graph_repo.find_candidates_by_symptoms(
+                symptoms=symptom_weights,
+                categories=[category],
+            )
+            if kg_candidates:
+                # Map Neo4j drug names → PG Drug ORM objects
+                kg_names = [c.generic_name for c in kg_candidates]
+                drugs_map = {d.generic_name: d for d in await drug_repo.find_by_ids_names(kg_names)}
+                # Preserve KG ordering, only keep drugs found in PG
+                result = [drugs_map[name] for name in kg_names if name in drugs_map]
+                if result:
+                    return result
+        except Exception:
+            pass  # KG query failed → fall through to PG fallback
+
+    # ── 降级：PG ILIKE ──
+    drugs = await drug_repo.find_by_symptoms(symptom_names, category=category)
+    if not drugs:
+        drugs = await drug_repo.list_all(category=category)
+    return drugs
 
 
 async def _generate_reasons(

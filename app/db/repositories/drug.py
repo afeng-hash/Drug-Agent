@@ -100,3 +100,18 @@ class DrugRepository:
         stmt = select(Drug).where(Drug.id.in_(drug_ids))
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
+
+    async def find_by_ids_names(self, names: list[str]) -> list[Drug]:
+        """按通用名列表批量查询药品。
+
+        Args:
+            names: 药品通用名列表，如 ["布洛芬", "对乙酰氨基酚"]
+
+        Returns:
+            匹配的药品列表（顺序不保证与输入一致）
+        """
+        if not names:
+            return []
+        stmt = select(Drug).where(Drug.generic_name.in_(names))
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())

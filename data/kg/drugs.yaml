@@ -1,0 +1,166 @@
+# 药品节点 + TREATS/HAS_INGREDIENT 关系
+# 每个 drug 对应 PostgreSQL drugs 表中的一条记录。
+# treats: 该药品治疗的症状列表（含强度 strength: 0-1）
+
+- generic_name: "布洛芬"
+  otc_type: "甲类"
+  dosage_form: "片剂/胶囊/混悬液"
+  category: "感冒退烧"
+  ingredients: ["布洛芬"]
+  treats:
+    - {symptom: "头痛", strength: 0.90}
+    - {symptom: "偏头痛", strength: 0.90}
+    - {symptom: "关节痛", strength: 0.80}
+    - {symptom: "发热", strength: 0.85}
+    - {symptom: "肌肉酸痛", strength: 0.70}
+    - {symptom: "四肢酸痛", strength: 0.65}
+    - {symptom: "紧张性头痛", strength: 0.80}
+    - {symptom: "太阳穴跳痛", strength: 0.85}
+    - {symptom: "后脑勺痛", strength: 0.75}
+
+- generic_name: "对乙酰氨基酚"
+  otc_type: "乙类"
+  dosage_form: "片剂/胶囊/滴剂"
+  category: "感冒退烧"
+  ingredients: ["对乙酰氨基酚"]
+  treats:
+    - {symptom: "头痛", strength: 0.90}
+    - {symptom: "偏头痛", strength: 0.90}
+    - {symptom: "关节痛", strength: 0.80}
+    - {symptom: "发热", strength: 0.90}
+    - {symptom: "高热", strength: 0.85}
+    - {symptom: "肌肉酸痛", strength: 0.65}
+    - {symptom: "紧张性头痛", strength: 0.80}
+    - {symptom: "太阳穴跳痛", strength: 0.85}
+
+- generic_name: "复方氨酚烷胺"
+  otc_type: "甲类"
+  dosage_form: "胶囊/片剂"
+  category: "感冒退烧"
+  ingredients: ["对乙酰氨基酚", "金刚烷胺", "咖啡因", "氯苯那敏"]
+  treats:
+    - {symptom: "发热", strength: 0.85}
+    - {symptom: "头痛", strength: 0.80}
+    - {symptom: "四肢酸痛", strength: 0.80}
+    - {symptom: "打喷嚏", strength: 0.80}
+    - {symptom: "流涕", strength: 0.80}
+    - {symptom: "鼻塞", strength: 0.80}
+    - {symptom: "咽喉痛", strength: 0.70}
+    - {symptom: "鼻塞流涕", strength: 0.75}
+
+- generic_name: "酚麻美敏"
+  otc_type: "甲类"
+  dosage_form: "片剂"
+  category: "感冒退烧"
+  ingredients: ["对乙酰氨基酚", "伪麻黄碱", "右美沙芬", "氯苯那敏"]
+  treats:
+    - {symptom: "发热", strength: 0.80}
+    - {symptom: "头痛", strength: 0.80}
+    - {symptom: "鼻塞", strength: 0.85}
+    - {symptom: "流涕", strength: 0.80}
+    - {symptom: "咳嗽", strength: 0.75}
+    - {symptom: "打喷嚏", strength: 0.75}
+    - {symptom: "干咳", strength: 0.70}
+
+- generic_name: "盐酸伪麻黄碱"
+  otc_type: "甲类"
+  dosage_form: "胶囊/片剂"
+  category: "感冒退烧"
+  ingredients: ["盐酸伪麻黄碱"]
+  treats:
+    - {symptom: "鼻塞", strength: 0.90}
+    - {symptom: "流涕", strength: 0.80}
+    - {symptom: "打喷嚏", strength: 0.70}
+    - {symptom: "鼻塞流涕", strength: 0.85}
+
+- generic_name: "氢溴酸右美沙芬"
+  otc_type: "甲类"
+  dosage_form: "片剂/糖浆"
+  category: "感冒退烧"
+  ingredients: ["氢溴酸右美沙芬"]
+  treats:
+    - {symptom: "干咳", strength: 0.90}
+    - {symptom: "咳嗽", strength: 0.70}
+    - {symptom: "刺激性干咳", strength: 0.90}
+    - {symptom: "夜间咳嗽加重", strength: 0.85}
+
+- generic_name: "马来酸氯苯那敏"
+  otc_type: "甲类"
+  dosage_form: "片剂"
+  category: "感冒退烧"
+  ingredients: ["马来酸氯苯那敏"]
+  treats:
+    - {symptom: "打喷嚏", strength: 0.90}
+    - {symptom: "流涕", strength: 0.85}
+    - {symptom: "鼻塞", strength: 0.80}
+    - {symptom: "流清涕", strength: 0.85}
+    - {symptom: "鼻痒喷嚏", strength: 0.90}
+
+- generic_name: "连花清瘟胶囊"
+  otc_type: "甲类"
+  dosage_form: "胶囊/颗粒"
+  category: "感冒退烧"
+  ingredients: ["连翘", "金银花", "炙麻黄", "炒苦杏仁", "石膏", "板蓝根", "绵马贯众", "鱼腥草", "广藿香", "大黄", "红景天", "薄荷脑", "甘草"]
+  treats:
+    - {symptom: "发热", strength: 0.70}
+    - {symptom: "高热", strength: 0.75}
+    - {symptom: "发热伴寒战", strength: 0.65}
+    - {symptom: "肌肉酸痛", strength: 0.70}
+    - {symptom: "鼻塞流涕", strength: 0.65}
+    - {symptom: "咳嗽", strength: 0.60}
+    - {symptom: "头痛", strength: 0.60}
+    - {symptom: "咽干", strength: 0.65}
+    - {symptom: "咽喉痛", strength: 0.65}
+    - {symptom: "全身不适", strength: 0.60}
+
+- generic_name: "板蓝根颗粒"
+  otc_type: "乙类"
+  dosage_form: "颗粒剂"
+  category: "感冒退烧"
+  ingredients: ["板蓝根"]
+  treats:
+    - {symptom: "咽喉痛", strength: 0.85}
+    - {symptom: "咽干", strength: 0.85}
+    - {symptom: "咽痒", strength: 0.70}
+    - {symptom: "晨起咽干", strength: 0.80}
+
+- generic_name: "维C银翘片"
+  otc_type: "甲类"
+  dosage_form: "片剂"
+  category: "感冒退烧"
+  ingredients: ["金银花", "连翘", "维生素C", "对乙酰氨基酚", "马来酸氯苯那敏"]
+  treats:
+    - {symptom: "发热", strength: 0.75}
+    - {symptom: "头痛", strength: 0.70}
+    - {symptom: "咳嗽", strength: 0.65}
+    - {symptom: "咽干", strength: 0.60}
+    - {symptom: "咽喉痛", strength: 0.65}
+    - {symptom: "打喷嚏", strength: 0.55}
+
+- generic_name: "氨咖黄敏"
+  otc_type: "甲类"
+  dosage_form: "胶囊"
+  category: "感冒退烧"
+  ingredients: ["对乙酰氨基酚", "咖啡因", "氯苯那敏", "人工牛黄"]
+  treats:
+    - {symptom: "发热", strength: 0.80}
+    - {symptom: "头痛", strength: 0.75}
+    - {symptom: "四肢酸痛", strength: 0.75}
+    - {symptom: "打喷嚏", strength: 0.80}
+    - {symptom: "流涕", strength: 0.80}
+    - {symptom: "鼻塞", strength: 0.80}
+    - {symptom: "咽喉痛", strength: 0.70}
+
+- generic_name: "正柴胡饮颗粒"
+  otc_type: "乙类"
+  dosage_form: "颗粒剂"
+  category: "感冒退烧"
+  ingredients: ["柴胡", "陈皮", "防风", "赤芍", "甘草", "生姜"]
+  treats:
+    - {symptom: "发热", strength: 0.60}
+    - {symptom: "发热伴寒战", strength: 0.70}
+    - {symptom: "头痛", strength: 0.65}
+    - {symptom: "鼻塞", strength: 0.65}
+    - {symptom: "打喷嚏", strength: 0.55}
+    - {symptom: "咽痒", strength: 0.55}
+    - {symptom: "四肢酸痛", strength: 0.60}

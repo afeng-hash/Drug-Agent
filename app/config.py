@@ -48,6 +48,20 @@ class Settings(BaseSettings):
     格式：postgresql+asyncpg://用户名:密码@主机:端口/数据库名
     使用 asyncpg 驱动（异步）"""
 
+    # ── Neo4j 配置 ──────────────────────────────────────
+
+    neo4j_uri: str = "bolt://localhost:7687"
+    """Neo4j Bolt 协议地址"""
+
+    neo4j_user: str = "neo4j"
+    """Neo4j 用户名"""
+
+    neo4j_password: str = ""
+    """Neo4j 密码。在 .env 中设置，形如 NEO4J_PASSWORD=xxx"""
+
+    neo4j_database: str = "neo4j"
+    """Neo4j 数据库名"""
+
     # ── Milvus 配置 ──────────────────────────────────────
 
     milvus_host: str = "localhost"

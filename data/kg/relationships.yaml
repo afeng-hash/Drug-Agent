@@ -1,0 +1,50 @@
+# 药品间关系
+# contraindicated_for: Drug → Condition/Population 禁忌
+# similar_to: Drug ↔ Drug 可替代药品（双向，只存一条）
+# interacts_with: Drug ↔ Drug 药物相互作用（双向，只存一条）
+
+# ── 禁忌病症 (Drug → Condition) ──
+
+contraindicated_for:
+  - {drug: "布洛芬", target_type: "Condition", target: "胃溃疡"}
+  - {drug: "布洛芬", target_type: "Condition", target: "哮喘"}
+  - {drug: "布洛芬", target_type: "Population", target: "孕妇"}
+  - {drug: "布洛芬", target_type: "Population", target: "哺乳期"}
+
+  - {drug: "对乙酰氨基酚", target_type: "Condition", target: "肝肾疾病"}
+  - {drug: "对乙酰氨基酚", target_type: "Population", target: "哺乳期"}
+
+  - {drug: "盐酸伪麻黄碱", target_type: "Condition", target: "高血压"}
+  - {drug: "盐酸伪麻黄碱", target_type: "Condition", target: "心脏病"}
+  - {drug: "盐酸伪麻黄碱", target_type: "Condition", target: "甲亢"}
+  - {drug: "盐酸伪麻黄碱", target_type: "Condition", target: "糖尿病"}
+
+  - {drug: "马来酸氯苯那敏", target_type: "Condition", target: "哮喘"}
+  - {drug: "马来酸氯苯那敏", target_type: "Condition", target: "青光眼"}
+
+  - {drug: "氢溴酸右美沙芬", target_type: "Condition", target: "肝肾疾病"}
+
+  - {drug: "复方氨酚烷胺", target_type: "Population", target: "儿童"}
+  - {drug: "酚麻美敏", target_type: "Population", target: "儿童"}
+  - {drug: "维C银翘片", target_type: "Population", target: "儿童"}
+  - {drug: "氨咖黄敏", target_type: "Population", target: "儿童"}
+
+  - {drug: "板蓝根颗粒", target_type: "Condition", target: "脾胃虚寒"}
+  - {drug: "板蓝根颗粒", target_type: "Condition", target: "糖尿病"}
+
+# ── 替代药品 (Drug ↔ Drug) ──
+
+similar_to:
+  - {drug_a: "布洛芬", drug_b: "对乙酰氨基酚"}
+  - {drug_a: "复方氨酚烷胺", drug_b: "氨咖黄敏"}
+  - {drug_a: "复方氨酚烷胺", drug_b: "酚麻美敏"}
+  - {drug_a: "连花清瘟胶囊", drug_b: "维C银翘片"}
+  - {drug_a: "盐酸伪麻黄碱", drug_b: "马来酸氯苯那敏"}
+
+# ── 药物相互作用 (Drug ↔ Drug, 避免联用) ──
+
+interacts_with:
+  - {drug_a: "复方氨酚烷胺", drug_b: "对乙酰氨基酚"}
+  - {drug_a: "酚麻美敏", drug_b: "对乙酰氨基酚"}
+  - {drug_a: "氨咖黄敏", drug_b: "对乙酰氨基酚"}
+  - {drug_a: "维C银翘片", drug_b: "对乙酰氨基酚"}

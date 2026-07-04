@@ -1,0 +1,8 @@
+# 特殊人群节点
+# 用于安全过滤：Drug -[:CONTRAINDICATED_FOR]-> Population
+# 用户 special_population 字段与此匹配
+
+- name: "孕妇"
+- name: "哺乳期"
+- name: "儿童"
+- name: "老人"

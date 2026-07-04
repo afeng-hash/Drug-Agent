@@ -30,6 +30,8 @@ from app.db.repositories.safety_log import SafetyLogRepository
 from app.db.repositories.session import SessionRepository
 from app.db.repositories.weight_config import WeightConfigRepository
 from app.graph.builder import build_graph
+from app.kg.client import Neo4jClient
+from app.kg.repository import DrugGraphRepository
 from app.llm.client import LLMClient
 from app.rag.retriever import DrugManualRetriever
 from app.rules.definitions import register_all_rules
@@ -67,6 +69,13 @@ async def lifespan(app: FastAPI):
     # ── LLM 客户端 ──
     llm_client = LLMClient(settings)
     app.state.llm_client = llm_client
+
+    # ── Neo4j 知识图谱 ──
+    neo4j_client = Neo4jClient.from_settings(settings)
+    await neo4j_client.initialize()  # 失败不抛异常，设置 _available=False
+    app.state.neo4j_client = neo4j_client
+    drug_graph_repo = DrugGraphRepository(neo4j_client)
+    app.state.drug_graph_repo = drug_graph_repo
 
     # ── 规则引擎（注册所有安全规则） ──
     rule_engine = RuleEngine()
@@ -115,6 +124,7 @@ async def lifespan(app: FastAPI):
         weight_repo_factory=weight_repo_factory,
         retriever=retriever,
         scoring_pipeline=scoring_pipeline,
+        drug_graph_repo=drug_graph_repo,
         max_consult_rounds=settings.max_consult_rounds,
     )
     app.state.graph = graph
@@ -124,6 +134,7 @@ async def lifespan(app: FastAPI):
     # ═══════════════════════════════════════════════
     # Shutdown
     # ═══════════════════════════════════════════════
+    await neo4j_client.close()
     await close_db()
 
 

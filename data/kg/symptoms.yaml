@@ -1,0 +1,166 @@
+# 症状层级 (3-level DAG)
+# level: 1=coarse, 2=specific, 3=fine-grained
+# parents: list of parent symptom names (IS_A relationship: child → parent)
+# Multiple parents allowed (DAG, not tree).
+
+- name: "头痛"
+  level: 1
+  aliases: ["头疼", "脑壳疼"]
+  parents: []
+
+- name: "偏头痛"
+  level: 2
+  aliases: ["偏头疼", "一边头疼"]
+  parents: ["头痛"]
+
+- name: "紧张性头痛"
+  level: 2
+  aliases: ["紧张型头痛", "紧绷感头痛"]
+  parents: ["头痛"]
+
+- name: "太阳穴跳痛"
+  level: 3
+  aliases: ["太阳穴疼", "颞部跳痛"]
+  parents: ["偏头痛", "紧张性头痛"]
+
+- name: "后脑勺痛"
+  level: 3
+  aliases: ["后枕部痛", "后颈痛"]
+  parents: ["紧张性头痛"]
+
+# ── 发热 ──
+
+- name: "发热"
+  level: 1
+  aliases: ["发烧", "体温升高", "低烧", "高烧"]
+  parents: []
+
+- name: "高热"
+  level: 2
+  aliases: ["高烧", "39度以上"]
+  parents: ["发热"]
+
+- name: "发热伴寒战"
+  level: 2
+  aliases: ["发烧怕冷", "寒战发热", "发冷发热"]
+  parents: ["发热"]
+
+# ── 咳嗽 ──
+
+- name: "咳嗽"
+  level: 1
+  aliases: ["咳", "咳嗦"]
+  parents: []
+
+- name: "干咳"
+  level: 2
+  aliases: ["干咳嗽", "无痰咳嗽"]
+  parents: ["咳嗽"]
+
+- name: "湿咳"
+  level: 2
+  aliases: ["有痰咳嗽", "咳痰"]
+  parents: ["咳嗽"]
+
+- name: "夜间咳嗽加重"
+  level: 3
+  aliases: ["晚上咳嗽", "睡觉咳嗽"]
+  parents: ["干咳"]
+
+- name: "刺激性干咳"
+  level: 3
+  aliases: ["喉咙痒咳嗽", "一直想咳"]
+  parents: ["干咳"]
+
+- name: "晨起咳嗽有痰"
+  level: 3
+  aliases: ["早上咳痰", "起床咳痰"]
+  parents: ["湿咳"]
+
+# ── 流涕/喷嚏 ──
+
+- name: "流涕"
+  level: 1
+  aliases: ["流鼻涕", "鼻涕"]
+  parents: []
+
+- name: "打喷嚏"
+  level: 2
+  aliases: ["喷嚏", "喷嚏不止"]
+  parents: ["流涕"]
+
+- name: "流清涕"
+  level: 2
+  aliases: ["清鼻涕", "水样鼻涕"]
+  parents: ["流涕"]
+
+- name: "鼻塞流涕"
+  level: 2
+  aliases: ["鼻塞加流涕", "鼻子不通还流涕"]
+  parents: ["流涕", "鼻塞"]
+
+- name: "晨起清涕"
+  level: 3
+  aliases: ["早上流清涕"]
+  parents: ["流清涕", "打喷嚏"]
+
+- name: "鼻痒喷嚏"
+  level: 3
+  aliases: ["鼻子痒打喷嚏", "鼻痒"]
+  parents: ["打喷嚏"]
+
+# ── 咽喉 ──
+
+- name: "咽喉痛"
+  level: 1
+  aliases: ["嗓子疼", "喉咙痛", "咽痛"]
+  parents: []
+
+- name: "咽干"
+  level: 2
+  aliases: ["嗓子干", "口干", "咽部干燥"]
+  parents: ["咽喉痛"]
+
+- name: "咽痒"
+  level: 2
+  aliases: ["嗓子痒", "喉咙痒", "咽部痒"]
+  parents: ["咽喉痛"]
+
+- name: "晨起咽干"
+  level: 3
+  aliases: ["早上嗓子干"]
+  parents: ["咽干"]
+
+# ── 全身 / 肌肉 ──
+
+- name: "全身不适"
+  level: 1
+  aliases: ["全身不舒服", "浑身难受"]
+  parents: []
+
+- name: "肌肉酸痛"
+  level: 2
+  aliases: ["肌肉疼", "浑身酸痛"]
+  parents: ["全身不适"]
+
+- name: "四肢酸痛"
+  level: 2
+  aliases: ["手脚酸痛", "胳膊腿疼"]
+  parents: ["全身不适", "肌肉酸痛"]
+
+- name: "关节痛"
+  level: 2
+  aliases: ["关节疼", "关节酸痛"]
+  parents: ["全身不适"]
+
+- name: "全身酸痛乏力"
+  level: 3
+  aliases: ["全身没劲", "酸痛无力"]
+  parents: ["肌肉酸痛", "四肢酸痛"]
+
+# ── 鼻塞 ──
+
+- name: "鼻塞"
+  level: 1
+  aliases: ["鼻子不通", "鼻子堵", "鼻堵"]
+  parents: []

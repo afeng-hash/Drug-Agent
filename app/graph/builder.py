@@ -51,6 +51,7 @@ def build_graph(
     weight_repo_factory,
     retriever: DrugManualRetriever,
     scoring_pipeline: ScoringPipeline,
+    drug_graph_repo=None,
     max_consult_rounds: int = 6,
 ) -> StateGraph:
     """构建并编译 LangGraph 状态机。
@@ -91,7 +92,7 @@ def build_graph(
 
     graph.add_node(
         "safety_check",
-        partial(safety_check_node, rule_engine=rule_engine),
+        partial(safety_check_node, rule_engine=rule_engine, drug_graph_repo=drug_graph_repo),
     )
     """安全筛查节点：规则引擎检查用药禁忌"""
 
@@ -99,7 +100,7 @@ def build_graph(
     # 所以用工厂模式（_make_* 闭包），而不是直接传 repo 实例
     graph.add_node(
         "recommend",
-        _make_recommend(llm_client, drug_repo_factory, weight_repo_factory, retriever, scoring_pipeline),
+        _make_recommend(llm_client, drug_repo_factory, weight_repo_factory, retriever, scoring_pipeline, drug_graph_repo),
     )
     """药品推荐节点：ScoringPipeline 排序 + RAG 说明书 + LLM 文案"""
 
@@ -188,11 +189,11 @@ def build_graph(
 # ──────────────────────────────────────────────────────────
 
 
-def _make_recommend(llm_client, drug_repo_factory, weight_repo_factory, retriever, scoring_pipeline):
+def _make_recommend(llm_client, drug_repo_factory, weight_repo_factory, retriever, scoring_pipeline, drug_graph_repo=None):
     """创建 recommend 节点的闭包。
 
     调用时机：每次 Graph 运行到 recommend 节点时。
-    内部逻辑：DB 查药品 → ScoringPipeline 排序 → RAG 查说明书 → LLM 写推荐文案 → 返回推荐。
+    内部逻辑：Neo4j 图查询药品 → ScoringPipeline 排序 → RAG 查说明书 → LLM 写推荐文案 → 返回推荐。
     """
     async def wrapped(state: ConversationState) -> dict:
         async with drug_repo_factory() as drug_repo, weight_repo_factory() as weight_repo:
@@ -203,6 +204,7 @@ def _make_recommend(llm_client, drug_repo_factory, weight_repo_factory, retrieve
                 weight_repo=weight_repo,
                 retriever=retriever,
                 scoring_pipeline=scoring_pipeline,
+                drug_graph_repo=drug_graph_repo,
             )
     return wrapped
 

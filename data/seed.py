@@ -107,6 +107,24 @@ async def seed():
         else:
             print("ℹ️  Weight config v1.0.0 already exists")
 
+    # ── Neo4j Knowledge Graph ──
+    try:
+        from app.kg.client import Neo4jClient
+        from app.kg.sync import GraphDataSync
+
+        kg_client = Neo4jClient.from_settings(settings)
+        await kg_client.initialize()
+        if kg_client.is_available():
+            kg_dir = os.path.join(data_dir, "kg")
+            sync = GraphDataSync(kg_client, kg_dir)
+            stats = await sync.seed_all()
+            print(f"✅ KG seeded: {stats['nodes']} nodes, {stats['relationships']} relationships")
+            await kg_client.close()
+        else:
+            print("⚠️  Neo4j not available — KG seed skipped")
+    except Exception as e:
+        print(f"⚠️  KG seed skipped (Neo4j may not be available): {e}")
+
     # ── RAG Documents ──
     llm_client = LLMClient(settings)
     retriever = DrugManualRetriever(settings, llm_client)

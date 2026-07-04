@@ -19,6 +19,10 @@ alembic>=1.14.0
 # Vector DB
 pymilvus>=2.5.0
 
+# Graph DB
+neo4j>=5.26.0
+pyyaml>=6.0
+
 # Config
 pydantic-settings>=2.6.0
 python-dotenv>=1.0.0

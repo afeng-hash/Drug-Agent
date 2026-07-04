@@ -1,0 +1,13 @@
+# 基础疾病/病症节点
+# 用于安全过滤：Drug -[:CONTRAINDICATED_FOR]-> Condition
+# 用户自报 chronic_conditions 与此列表匹配
+
+- name: "胃溃疡"
+- name: "哮喘"
+- name: "高血压"
+- name: "肝肾疾病"
+- name: "心脏病"
+- name: "甲亢"
+- name: "糖尿病"
+- name: "青光眼"
+- name: "脾胃虚寒"
