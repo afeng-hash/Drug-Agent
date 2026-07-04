@@ -93,8 +93,7 @@ async def recommend_node(
     )
     symptom_names = primary_names + secondary_names
 
-    # ── 2. 查询候选药品（Neo4j 优先 → PG ILIKE 降级）──
-    # todo
+    # ── 2. 查询候选药品（KG 唯一数据源）──
     candidates = await _fetch_candidates(
         drug_graph_repo=drug_graph_repo,
         drug_repo=drug_repo,
@@ -253,52 +252,56 @@ async def _fetch_candidates(
     symptom_names: list[str],
     category: str,
 ) -> list:
-    """查询候选药品：Neo4j 图查询优先，PG ILIKE 降级。
+    """通过 Neo4j 知识图谱查询候选药物。
 
-    Neo4j 返回排好序的药品名 → 从 PG 补全 Drug ORM 对象。
-    降级时直接用 PG ILIKE 查询。
+     Args:
+         drug_graph_repo: DrugGraphRepository 实例（图数据库仓库）
+         drug_repo:       PG DrugRepository 实例（仅用于获取 Drug ORM 对象的元数据）
+         symptom_weights: 症状权重列表，格式为 [{name, weight}, ...]，用于 Neo4j 评分计算
+         symptom_names:   纯症状名称列表（当前未使用，保留仅为向后兼容）
+         category:        药物分类过滤条件
 
-    Args:
-        drug_graph_repo: DrugGraphRepository or None
-        drug_repo:       PG DrugRepository (always available)
-        symptom_weights: [{name, weight}, ...] for Neo4j scoring
-        symptom_names:   plain name list for PG ILIKE fallback
-        category:        drug category filter
-
-    Returns:
-        List of Drug ORM objects, ordered by relevance (Neo4j score or PG ILIKE order)
+     Returns:
+         Drug ORM 对象列表，按知识图谱相关性评分降序排列。
+         若未找到匹配项，则返回空列表。
     """
-    # ── 优先：Neo4j 图查询 ──
-    if drug_graph_repo is not None:
-        try:
-            kg_candidates = await drug_graph_repo.find_candidates_by_symptoms(
-                symptoms=symptom_weights,
-                categories=[category],
-            )
-            if kg_candidates:
-                #构建“药物名称 → 调整后评分（adjusted_score）”的映射字典，作为桥接 ScoringPipeline（评分流水线）的数据载体。
-                kg_score_map = {c.generic_name: c.score for c in kg_candidates}
-                # Map Neo4j drug names → PG Drug ORM objects
-                kg_names = [c.generic_name for c in kg_candidates]
-                drugs_map = {d.generic_name: d for d in await drug_repo.find_by_ids_names(kg_names)}
-                # Preserve KG ordering, only keep drugs found in PG
-                # 为“图相关性评分（GraphRelevanceScore）”证据规则附加 `_graph_score` 属性。
-                result = []
-                for name in kg_names:
-                    drug = drugs_map.get(name)
-                    if drug:
-                        drug._graph_score = kg_score_map.get(name)
-                        result.append(drug)
-                if result:
-                    return result
-        except Exception:
-            pass  # KG query failed → fall through to PG fallback
+    kg_candidates = await drug_graph_repo.find_candidates_by_symptoms(
+        symptoms=symptom_weights,
+        categories=[category],
+    )
 
-    # ── 降级：PG ILIKE ──
-    drugs = await drug_repo.find_by_symptoms(symptom_names, category=category)
-    if not drugs:
-        drugs = await drug_repo.list_all(category=category)
-    return drugs
+    if not kg_candidates:
+        logger.warning(
+            "KG returned no candidates for symptoms=%s category=%s",
+            symptom_weights, category,
+        )
+        return []
+
+    # 构建"药物名称 → KG 数据"映射字典，桥接 ScoringPipeline
+    kg_score_map = {c.generic_name: c.score for c in kg_candidates}
+    kg_matched_map = {c.generic_name: c.matched_symptom_count for c in kg_candidates}
+    kg_total_treats_map = {c.generic_name: c.drug_total_treats for c in kg_candidates}
+    kg_names = [c.generic_name for c in kg_candidates]
+
+    # 从 PG 补全 Drug ORM 元数据
+    drugs_map = {d.generic_name: d for d in await drug_repo.find_by_ids_names(kg_names)}
+
+    # 保持 KG 排序，附加临时属性供证据规则读取：
+    #   _graph_score          → GraphRelevanceScore 使用
+    #   _graph_matched_count  → SymptomFocusRatio 分子
+    #   _graph_total_treats   → SymptomFocusRatio 分母
+    result = []
+    for name in kg_names:
+        drug = drugs_map.get(name)
+        if drug:
+            drug._graph_score = kg_score_map.get(name)
+            drug._graph_matched_count = kg_matched_map.get(name)
+            drug._graph_total_treats = kg_total_treats_map.get(name)
+            result.append(drug)
+        else:
+            logger.warning("KG drug '%s' not found in PG, skipping", name)
+
+    return result
 
 
 async def _generate_reasons(

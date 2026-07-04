@@ -2,25 +2,19 @@
 证据引擎（EvidenceEngine）— 管理证据规则、执行评估、合并为特征向量。
 
 这是评分管线的第二步（第一步是加载权重配置）。EvidenceEngine
-注册了 7 条证据规则，对每个候选药品逐条执行，然后将结果按合并策略
+注册了 4 条证据规则，对每个候选药品逐条执行，然后将结果按合并策略
 聚合成一个 FeatureVector（dict[str, float]）。
 
 核心设计：
   - 每条规则独立评估 (slots, drug)，输出 EvidenceResult
-  - 同一个 feature_name 可能被多条规则影响
-  - 合并策略（merge_strategy）决定了当多条规则影响同一特征时如何处理：
-    - 'max' → 取最大值（症状匹配类：任一命中即高分）
-    - 'min' → 取最小值（安全类：任一风险即否决）
-    - 'avg' → 取平均值（多条证据等权重）
-    - 'set' → 直接覆盖（确定性属性，无竞争）
+  - 每个 feature_name 只有一条规则（set 合并），不存在竞争
+  - 安全相关规则（过敏、禁忌）已前移到 KG 硬过滤层，不进入评分
 
 默认特征值（DEFAULT_FEATURES）是"没有任何证据"时的初始状态：
-  - symptom_match: 0.0       ← 还没匹配，从零开始
-  - safety: 1.0              ← 假设安全，直到证据证明有风险
-  - age_suitability: 0.5     ← 中性（不知道年龄段）
-  - otc_safety_level: 0.7    ← 假设甲类（偏保守）
-  - ingredient_coverage: 0.0 ← 还没计算覆盖度
-  - evidence_quality: 0.5    ← 中性（预留维度）
+  - symptom_match: 0.0           ← 还没匹配，从零开始
+  - symptom_focus_ratio: 1.0     ← 假设全覆盖（中性，不影响几何平均）
+  - age_suitability: 0.5         ← 中性（不知道年龄段）
+  - otc_safety_level: 0.7        ← 假设甲类（偏保守）
 """
 
 from app.scorer.evidence.base import BaseEvidence
@@ -29,12 +23,10 @@ from app.scorer.schemas import EvidenceResult
 
 # 默认特征值：在没有任何证据规则被应用之前的初始状态
 DEFAULT_FEATURES: dict[str, float] = {
-    "symptom_match": 0.0,       # 症状匹配：从零开始，证据给出正向分值
-    "safety": 1.0,              # 安全性：假设安全，证据发现风险后降低
-    "age_suitability": 0.5,     # 年龄适用性：中性（尚不知道年龄）
-    "otc_safety_level": 0.7,    # OTC 安全等级：假设甲类（偏保守默认）
-    "ingredient_coverage": 0.0, # 成分覆盖度：从零开始计算
-    "evidence_quality": 0.5,    # 证据质量：中性（预留，当前无证据规则填充此维度）
+    "symptom_match": 0.0,              # 症状匹配：从零开始，图谱证据给出正向分值
+    "symptom_focus_ratio": 1.0,        # 覆盖比：默认全覆盖（中性，不影响几何平均）
+    "age_suitability": 0.5,            # 年龄适用性：中性（尚不知道年龄）
+    "otc_safety_level": 0.7,           # OTC 安全等级：假设甲类（偏保守默认）
 }
 
 

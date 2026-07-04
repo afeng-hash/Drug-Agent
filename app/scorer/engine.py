@@ -4,20 +4,29 @@ ScoringEngine — 纯函数：FeatureVector × Weights → ScoredDrug 评分。
 这是评分管线的第三步（第四步是排序后生成推荐文案）。
 完全确定性：无 IO、无随机数、无全局状态。相同输入 100% 可复现。
 
-核心公式：
-  total_score = Σ (w_i × f_i)  /  Σ w_i
+核心公式（几何加权平均）：
+  total_score = exp( Σ w_i × ln(f_i) )
 
   其中：
-    w_i = 权重配置中第 i 个维度的权重（来自 PostgreSQL weights_config 表）
-    f_i = 证据引擎输出的第 i 个特征值（FeatureVector，来自 EvidenceEngine）
+    w_i = 归一化后的权重（Σw_i = 1.0）
+    f_i = 特征值，范围 (0, 1]
 
-  权重会在内部自动归一化（使 Σw_i = 1.0），因此总分范围 0.0 ~ 1.0。
+  几何平均的语义：
+    - f_i = 1.0 → 该维度对分数完全中性（不贡献，不惩罚）
+    - f_i → 0.0 → 分数趋近于 0（强惩罚）
+    - w_i 控制该维度的"弹性"——权重越大，该维度变化对分数的影响越大
+
+  为什么不用线性加权和？
+    线性模型下所有维度贡献"基线分"——safety=1.0 仍然给 +0.25 的加分，
+    导致安全维度挤占 symptom_match 的区分空间。几何平均中，值为 1.0
+    的特征不贡献任何分数，只负责"不惩罚"。
 
 安全阈值（safety_threshold）：
-  如果 features['safety'] < safety_threshold，该药品被标记为 excluded=True。
-  被排除的药品不计入推荐列表。默认阈值 0.2。
+  硬过滤已在评分前由 KG _filter_by_kg_contraindications 完成。
+  safety_threshold 保留用于降级场景（KG 不可用时的 PG 证据规则）。
 """
 
+import math
 import time
 
 from app.scorer.schemas import DimensionScore, ScoredDrug, ScoringResult
@@ -83,14 +92,15 @@ def score_one(
 ) -> ScoredDrug:
     """对单个药品执行评分。
 
-    公式：total_score = Σ (norm_weight_i × feature_i)
+    公式：total_score = exp( Σ (norm_w_i × ln(f_i)) )
     安全筛查：如果 safety < threshold → excluded=True
+    （注意：KG 路径下安全硬过滤已在评分前完成）
 
     Args:
         features:          EvidenceEngine 输出的特征向量，
-                          如 {"symptom_match": 0.85, "safety": 1.0, ...}
+                          如 {"symptom_match": 0.57, "symptom_focus_ratio": 1.0, ...}
         weights:           原始权重配置（内部会归一化），
-                          如 {"symptom_match": 30, "safety": 25, ...}
+                          如 {"symptom_match": 50, "symptom_focus_ratio": 15, ...}
         drug_id:           药品 ID
         generic_name:      药品通用名
         safety_threshold:  safety 特征的排除阈值。safety < 此值则排除该药品
@@ -118,27 +128,35 @@ def score_one(
             ),
         )
 
-    # ── 计算各维度贡献 ──
+    # ── 几何加权平均 ──
+    # score = exp( Σ w_i × ln(f_i) )
+    # 其中 w_i 已归一化使 Σw_i = 1.0
     dimensions: list[DimensionScore] = []
-    total = 0.0
+    log_total = 0.0
 
     for feature_name, weight in norm_weights.items():
-        fv = features.get(feature_name, 0.0)   # 特征值（如果 Engine 没输出该维度，默认 0）
-        contribution = weight * fv              # w × f
-        total += contribution
+        # 几何平均下，缺失特征默认为 1.0（中性，不影响分数）
+        fv = features.get(feature_name, 1.0)
+        # 防止 ln(0)：特征值为 0 时钳制到一个极小的正数
+        safe_fv = max(fv, 1e-8)
+        log_contribution = weight * math.log(safe_fv)
+        log_total += log_contribution
         reasons = _collect_evidence_reasons(feature_name, evidence_details or [])
+        # contribution 记录 ln 空间中的贡献（用于调试）
         dimensions.append(DimensionScore(
             feature_name=feature_name,
             weight=weight,
             feature_value=fv,
-            contribution=contribution,
+            contribution=round(log_contribution, 6),
             evidence_reasons=reasons,
         ))
+
+    total_score = round(math.exp(log_total), 4)
 
     return ScoredDrug(
         drug_id=drug_id,
         generic_name=generic_name,
-        total_score=round(total, 4),   # 四舍五入到 4 位小数，避免浮点噪音
+        total_score=total_score,
         dimensions=dimensions,
         excluded=False,
     )

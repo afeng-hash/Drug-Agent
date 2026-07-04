@@ -94,7 +94,9 @@ class DrugGraphRepository:
 
         cypher = """
         UNWIND $symptoms AS sym
-        MATCH (s:Symptom {name: sym.name})
+        // Match on canonical name OR aliases (LLM-extracted names may differ)
+        MATCH (s:Symptom)
+        WHERE s.name = sym.name OR sym.name IN s.aliases
 
         // Expand IS_A upward (0..2 hops): s → ... → ancestor
         MATCH path = (s)-[:IS_A*0..2]->(ancestor:Symptom)

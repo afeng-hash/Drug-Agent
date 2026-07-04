@@ -20,12 +20,9 @@ from app.db.repositories.weight_config import WeightConfigRepository
 from app.scorer.engine import score_all
 from app.scorer.evidence import (
     AgeSuitability,
-    AllergyCheck,
-    ContraindicationCheck,
-    IngredientCoverage,
+    GraphRelevanceScore,
     OtcSafetyLevel,
-    SymptomKeywordMatch,
-    SymptomSeverityMatch,
+    SymptomFocusRatio,
 )
 from app.scorer.evidence_engine import EvidenceEngine
 from app.scorer.schemas import ScoringResult
@@ -50,23 +47,28 @@ class ScoringPipeline:
         self._validator = StrategyValidator()
 
     def _register_default_evidence(self) -> None:
-        """注册全部 7 条内置证据规则。
+        """注册 4 条内置证据规则。
 
-        图谱分数（Neo4j coverage × precision）在 run() 中直接覆盖
-        symptom_match 特征值，不通过证据规则（避免 max 合并被 ILIKE 高分压过）。
+        安全相关规则（ContraindicationCheck、AllergyCheck）已移除：
+        KG 的 _filter_by_kg_contraindications 在评分前完成硬过滤，
+        安全维度不再进入评分。
+
+        SymptomKeywordMatch（ILIKE）和 SymptomSeverityMatch（发热加成）已移除：
+        发热维度也已被图谱的 coverage 计算自然覆盖。
+
+        IngredientCoverage 已移除：与 symptom_match 功能重复。
         """
-        # symptom_match 维度（max 合并）
-        self._evidence_engine.register(SymptomKeywordMatch())    # 症状关键词匹配（ILIKE 降级）
-        self._evidence_engine.register(SymptomSeverityMatch())   # 发热成分加成
+        # symptom_match 维度（唯一来源：KG adjusted score）
+        self._evidence_engine.register(GraphRelevanceScore())
 
-        # safety 维度（min 合并）
-        self._evidence_engine.register(ContraindicationCheck())  # 禁忌症检查
-        self._evidence_engine.register(AllergyCheck())           # 过敏检查
+        # symptom_focus_ratio 维度（集合覆盖比）
+        self._evidence_engine.register(SymptomFocusRatio())
 
-        # 其他维度
-        self._evidence_engine.register(AgeSuitability())         # 年龄段适用性
-        self._evidence_engine.register(IngredientCoverage())     # 成分覆盖度
-        self._evidence_engine.register(OtcSafetyLevel())         # OTC 安全等级
+        # age_suitability 维度（年龄段软惩罚）
+        self._evidence_engine.register(AgeSuitability())
+
+        # otc_safety_level 维度（甲类/乙类偏好）
+        self._evidence_engine.register(OtcSafetyLevel())
 
     async def run(
         self,
@@ -95,36 +97,36 @@ class ScoringPipeline:
         Returns:
             ScoringResult：已排序的药品列表 + 配置版本 + 耗时
         """
+        import logging
+        _logger = logging.getLogger("drug-scorer")
+
         try:
             # ── 1. 加载权重配置（含 A/B 路由） ──
             config = await weight_repo.get_active(session_id)
+            _logger.info(
+                "ScoringPipeline: config version=%s policy=%s weights=%s",
+                config.version, config.policy, config.weights,
+            )
 
             # ── 2. 校验配置 ──
             is_valid, reason = self._validator.validate(config.weights, config.policy)
             if not is_valid:
-                # 校验失败只记录日志，不阻塞用户
-                import logging
-                logging.getLogger("drug-scorer").warning(
-                    f"Weight config validation warning: {reason}"
-                )
+                _logger.warning("Weight config validation warning: %s", reason)
 
             # ── 3. 逐个药品评估证据 ──
             features_list = []
             evidence_details_list = []
             for drug in candidates:
+                gs = getattr(drug, '_graph_score', 'NOT_SET')
+                gm = getattr(drug, '_graph_matched_count', 'NOT_SET')
+                gt = getattr(drug, '_graph_total_treats', 'NOT_SET')
                 features, details = self._evidence_engine.evaluate_with_detail(slots, drug)
                 features_list.append(features)
                 evidence_details_list.append(details)
-
-            # ── 3b. 图谱分数覆盖 symptom_match ──
-            # Neo4j 图谱的 (coverage × precision) 分比 ILIKE 文本匹配更精细。
-            # 由于 EvidenceEngine 使用 max 合并策略，ILIKE 的离散高分（0.7/1.0）
-            # 会压过图谱的连续分。这里直接覆盖，确保图谱分优先生效。
-            # 只有 _graph_score 已设置（Neo4j 可用）时才覆盖。
-            for i, drug in enumerate(candidates):
-                gs = getattr(drug, '_graph_score', None)
-                if gs is not None:
-                    features_list[i]["symptom_match"] = min(max(float(gs), 0.0), 1.0)
+                _logger.info(
+                    "Drug %s: _graph_score=%s _graph_matched=%s _graph_total=%s features=%s",
+                    drug.generic_name, gs, gm, gt, features,
+                )
 
             # ── 4. 批量评分 ──
             result = score_all(
@@ -135,15 +137,20 @@ class ScoringPipeline:
                 evidence_details_list=evidence_details_list,
             )
 
+            for sd in result.drugs:
+                _logger.info(
+                    "Scored %s: total=%.4f excluded=%s dimensions=%s",
+                    sd.generic_name, sd.total_score, sd.excluded,
+                    {d.feature_name: f"{d.feature_value:.3f}" for d in sd.dimensions},
+                )
+
             # ── 5. 附上配置版本 ──
             result.config_version = config.version
             return result
 
         except Exception as e:
-            # 降级：简单排序（乙类优先 → 字母序）
-            import logging
-            logging.getLogger("drug-scorer").error(
-                f"Scoring pipeline failed, using fallback sort: {e}"
+            _logger.error(
+                "Scoring pipeline failed, using fallback sort: %s", e, exc_info=True
             )
             return _fallback_sort(candidates)
 
