@@ -276,11 +276,19 @@ async def _fetch_candidates(
                 categories=[category],
             )
             if kg_candidates:
+                #构建“药物名称 → 调整后评分（adjusted_score）”的映射字典，作为桥接 ScoringPipeline（评分流水线）的数据载体。
+                kg_score_map = {c.generic_name: c.score for c in kg_candidates}
                 # Map Neo4j drug names → PG Drug ORM objects
                 kg_names = [c.generic_name for c in kg_candidates]
                 drugs_map = {d.generic_name: d for d in await drug_repo.find_by_ids_names(kg_names)}
                 # Preserve KG ordering, only keep drugs found in PG
-                result = [drugs_map[name] for name in kg_names if name in drugs_map]
+                # 为“图相关性评分（GraphRelevanceScore）”证据规则附加 `_graph_score` 属性。
+                result = []
+                for name in kg_names:
+                    drug = drugs_map.get(name)
+                    if drug:
+                        drug._graph_score = kg_score_map.get(name)
+                        result.append(drug)
                 if result:
                     return result
         except Exception:

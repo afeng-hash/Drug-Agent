@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 # ────────────────────────────────────────────────────────────
 
 class SymptomNode(BaseModel):
-    """Neo4j 中的“症状（Symptom）”节点，
+    """Neo4j 中的"症状（Symptom）"节点，
         通过 IS_A（属于/是一种）关系构成一个 3 层的有向无环图（DAG）。
     """
     name: str                           # canonical name, e.g. "头痛"
@@ -53,14 +53,14 @@ class PopulationNode(BaseModel):
 # ────────────────────────────────────────────────────────────
 
 class TreatsRelation(BaseModel):
-    """药物“治疗（TREATS）”症状的关系。"""
+    """药物"治疗（TREATS）"症状的关系。"""
     drug: str                           # Drug.generic_name
     symptom: str                        # Symptom.name
     strength: float = 1.0               # 0-1, strong indication vs weak coverage
 
 
 class ContraindicatedRelation(BaseModel):
-    """药物“禁忌（CONTRAINDICATED_FOR）”疾病/人群的关系。"""
+    """药物"禁忌（CONTRAINDICATED_FOR）"疾病/人群的关系。"""
     drug: str
     target_type: str                    # "Condition" | "Population"
     target_name: str
@@ -73,7 +73,7 @@ class SimilarToRelation(BaseModel):
 
 
 class IsARelation(BaseModel):
-    """症状“属于（IS_A）”症状的关系（子节点 → 父节点，构成有向无环图 DAG）"""
+    """症状"属于（IS_A）"症状的关系（子节点 → 父节点，构成有向无环图 DAG）"""
     child: str                          # specific symptom name
     parent: str                         # more general symptom name
 
@@ -92,11 +92,14 @@ class MatchDetail(BaseModel):
 
 
 class DrugCandidate(BaseModel):
-    """通过“症状 → 药物”图查询得到的候选药物。"""
+    """通过「症状 → 药物」图查询得到的候选药物。"""
     generic_name: str
-    score: float                        # Σ(strength × symptom_weight × decay)
+    score: float                        # coverage × specificity^ALPHA（调整后的最终分数）
+    coverage_score: float = 0.0         # 原始覆盖度 Σ(strength × weight × decay)
     matched_symptoms: list[str] = Field(default_factory=list)
     match_details: list[MatchDetail] = Field(default_factory=list)
+    drug_total_treats: int = 0          # 药品 TREATS 的独立症状总数
+    matched_symptom_count: int = 0      # 与用户症状匹配到的独立症状数
 
 
 class ContraindicationResult(BaseModel):

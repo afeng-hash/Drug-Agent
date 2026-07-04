@@ -33,11 +33,11 @@ class TestDrugGraphRepository:
 
     @pytest.mark.asyncio
     async def test_find_candidates_returns_sorted(self, repo, mock_client):
-        """Should return DrugCandidates sorted by score descending."""
+        """Should return DrugCandidates sorted by adjusted score descending."""
         mock_client.run.return_value = [
-            {"drug": "布洛芬", "total_score": 1.35, "matched_symptoms": ["头痛", "发热"], "match_details": []},
-            {"drug": "对乙酰氨基酚", "total_score": 1.30, "matched_symptoms": ["头痛", "发热"], "match_details": []},
-            {"drug": "板蓝根颗粒", "total_score": 0.42, "matched_symptoms": ["头痛"], "match_details": []},
+            {"drug": "布洛芬", "coverage_score": 1.35, "matched_symptoms": ["头痛", "发热"], "match_details": [], "drug_total_treats": 2},
+            {"drug": "对乙酰氨基酚", "coverage_score": 1.30, "matched_symptoms": ["头痛", "发热"], "match_details": [], "drug_total_treats": 2},
+            {"drug": "板蓝根颗粒", "coverage_score": 0.42, "matched_symptoms": ["头痛"], "match_details": [], "drug_total_treats": 1},
         ]
 
         symptoms = [
@@ -48,9 +48,10 @@ class TestDrugGraphRepository:
 
         assert len(result) == 3
         assert result[0].generic_name == "布洛芬"
-        assert result[0].score == 1.35
         assert result[1].generic_name == "对乙酰氨基酚"
         assert result[2].generic_name == "板蓝根颗粒"
+        # When drug_total_treats == matched_count, specificity=1.0, adjusted = coverage
+        assert result[0].coverage_score == 1.35
 
     @pytest.mark.asyncio
     async def test_find_candidates_empty_when_unavailable(self, repo, mock_client):
@@ -70,25 +71,27 @@ class TestDrugGraphRepository:
 
     @pytest.mark.asyncio
     async def test_find_candidates_calculates_score_correctly(self, repo, mock_client):
-        """Score should be: strength × weight × decay."""
+        """Coverage score: strength × weight × decay. Adjusted adds specificity."""
         # Direct match (0-hop): strength=0.9, weight=1.0, decay=1.0 → 0.9
         # Ancestor match (1-hop): strength=0.8, weight=1.0, decay=0.7 → 0.56
         mock_client.run.return_value = [
             {
                 "drug": "布洛芬",
-                "total_score": 0.90,
+                "coverage_score": 0.90,
                 "matched_symptoms": ["偏头痛"],
                 "match_details": [
                     {"symptom": "偏头痛", "strength": 0.9, "distance": 0, "decay": 1.0, "contribution": 0.90},
                 ],
+                "drug_total_treats": 1,
             },
             {
                 "drug": "酚麻美敏",
-                "total_score": 0.56,
+                "coverage_score": 0.56,
                 "matched_symptoms": ["偏头痛"],
                 "match_details": [
                     {"symptom": "偏头痛", "strength": 0.8, "distance": 1, "decay": ANCESTOR_DECAY, "contribution": 0.56},
                 ],
+                "drug_total_treats": 1,
             },
         ]
 
@@ -96,9 +99,9 @@ class TestDrugGraphRepository:
         result = await repo.find_candidates_by_symptoms(symptoms)
 
         assert result[0].generic_name == "布洛芬"
-        assert result[0].score == pytest.approx(0.90)
+        assert result[0].coverage_score == pytest.approx(0.90)
         assert result[1].generic_name == "酚麻美敏"
-        assert result[1].score == pytest.approx(0.56)
+        assert result[1].coverage_score == pytest.approx(0.56)
 
     @pytest.mark.asyncio
     async def test_find_candidates_with_category_filter(self, repo, mock_client):
@@ -249,11 +252,12 @@ class TestDrugGraphRepository:
         mock_client.run.return_value = [
             {
                 "drug": "布洛芬",
-                "total_score": 0.9,
+                "coverage_score": 0.9,
                 "matched_symptoms": ["头痛"],
                 "match_details": [
                     {"symptom": "头痛", "strength": 0.9, "distance": 0, "decay": 1.0, "contribution": 0.9},
                 ],
+                "drug_total_treats": 1,
             },
         ]
 
@@ -270,11 +274,12 @@ class TestDrugGraphRepository:
         mock_client.run.return_value = [
             {
                 "drug": "酚麻美敏",
-                "total_score": 0.504,
+                "coverage_score": 0.504,
                 "matched_symptoms": ["太阳穴跳痛"],
                 "match_details": [
                     {"symptom": "太阳穴跳痛", "strength": 0.8, "distance": 2, "decay": ANCESTOR_DECAY, "contribution": 0.56},
                 ],
+                "drug_total_treats": 1,
             },
         ]
 

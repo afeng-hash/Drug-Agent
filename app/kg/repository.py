@@ -1,9 +1,8 @@
 """
-DrugGraphRepository — Cypher query methods for drug recommendation use cases.
-
-All Cypher is encapsulated here. Callers never write raw queries.
-Every method checks client.is_available() before querying and returns
-safe defaults when Neo4j is unavailable.
+DrugGraphRepository（药物图数据仓储层）—— 专为药物推荐业务场景封装的 Cypher 查询方法集。
+所有的 Cypher 查询语句均在此类中集中封装，调用方（Callers）绝不允许直接编写原始查询语句。
+每个查询方法在执行前都会检查 `client.is_available()`，当 Neo4j 不可用时，
+会自动返回安全的默认值（safe defaults）以确保系统不崩溃。
 """
 
 import logging
@@ -18,9 +17,36 @@ from app.kg.schemas import (
 
 logger = logging.getLogger(__name__)
 
-# Decay factor for ancestor symptoms (1-2 hops away via IS_A).
-# Direct match (0 hops) = 1.0, ancestor match (1-2 hops) = 0.7
+# 祖先症状的衰减因子（针对通过 IS_A 关系向上回溯 1 到 2 跳的节点）。
+# 评分规则：直接匹配（0 跳）= 1.0，祖先节点匹配（1-2 跳）= 0.7。
 ANCESTOR_DECAY = 0.7
+
+# ── 精确度 / 特异性评分 ──────────────────────────
+# 精确度机制旨在：当用户描述的症状较少时，对“广谱药物”进行惩罚。
+# 例如：一款药物能治疗 7 种症状但仅匹配了用户的 1 个症状，
+#       它的得分将低于另一款总共只治疗 2 种症状且同样匹配了 1 个症状的药物。
+#
+# 计算公式：adjusted = coverage × specificity^ALPHA
+#   其中：specificity（特异性） = (matched + BETA) / (drug_total_treats + BETA)
+
+SPECIFICITY_BETA = 1.0   # 平滑常数（Smoothing constant）：用于防止除零错误以及避免极端惩罚。
+SPECIFICITY_ALPHA = 0.5  # 精确度惩罚强度（Precision penalty strength）：0 = 无惩罚，1 = 线性比例惩罚。
+
+
+def _compute_adjusted_score(coverage: float, matched: int, total: int) -> float:
+    """计算经过精确度调整后的评分（Precision-adjusted score）。
+
+     计算公式：
+       特异性 (specificity) = (已匹配症状数 + BETA) / (药物总治疗症状数 + BETA)
+       调整后评分 (adjusted) = 覆盖率 (coverage) × 特异性 (specificity)^ALPHA
+
+     作用说明：
+     当用户描述的症状较少时，该机制会对“广谱药物”进行惩罚。
+     - BETA（平滑常数）：用于防止除零错误，并弱化极端的惩罚效果；
+     - ALPHA（惩罚强度）：用于控制精确度惩罚的力度。
+    """
+    specificity = (matched + SPECIFICITY_BETA) / (total + SPECIFICITY_BETA)
+    return coverage * (specificity ** SPECIFICITY_ALPHA)
 
 
 class DrugGraphRepository:
@@ -90,8 +116,14 @@ class DrugGraphRepository:
              strength * symptom_weight *
                CASE WHEN min_dist = 0 THEN 1.0 ELSE $decay END AS contribution
 
+        // Count drug breadth: total distinct symptoms treated
+        OPTIONAL MATCH (d2:Drug {generic_name: drug})-[:TREATS]->(all_symptom:Symptom)
+        WITH drug, contribution, matched_symptom, strength, min_dist,
+             COUNT(DISTINCT all_symptom) AS drug_total_treats
+
         RETURN drug,
-               SUM(contribution) AS total_score,
+               SUM(contribution) AS coverage_score,
+               drug_total_treats,
                COLLECT(DISTINCT matched_symptom) AS matched_symptoms,
                COLLECT({
                  symptom: matched_symptom,
@@ -100,7 +132,7 @@ class DrugGraphRepository:
                  decay: CASE WHEN min_dist = 0 THEN 1.0 ELSE $decay END,
                  contribution: contribution
                }) AS match_details
-        ORDER BY total_score DESC
+        ORDER BY coverage_score DESC
         """
 
         params: dict = {
@@ -123,10 +155,20 @@ class DrugGraphRepository:
             logger.error("find_candidates_by_symptoms failed: %s", exc)
             return []
 
-        return [
+        candidates = [
             DrugCandidate(
                 generic_name=row["drug"],
-                score=round(row["total_score"], 4),
+                coverage_score=round(row["coverage_score"], 4),
+                drug_total_treats=row["drug_total_treats"],
+                matched_symptom_count=len(row["matched_symptoms"]),
+                score=round(
+                    _compute_adjusted_score(
+                        coverage=row["coverage_score"],
+                        matched=len(row["matched_symptoms"]),
+                        total=row["drug_total_treats"],
+                    ),
+                    4,
+                ),
                 matched_symptoms=row["matched_symptoms"],
                 match_details=[
                     MatchDetail(
@@ -141,6 +183,9 @@ class DrugGraphRepository:
             )
             for row in rows
         ]
+        # Sort by adjusted score (coverage × specificity) descending
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        return candidates
 
     # ── F3: Contraindication Checks ────────────────────────
 

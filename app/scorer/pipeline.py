@@ -52,10 +52,11 @@ class ScoringPipeline:
     def _register_default_evidence(self) -> None:
         """注册全部 7 条内置证据规则。
 
-        注册顺序无所谓（合并策略决定最终值）。
+        图谱分数（Neo4j coverage × precision）在 run() 中直接覆盖
+        symptom_match 特征值，不通过证据规则（避免 max 合并被 ILIKE 高分压过）。
         """
         # symptom_match 维度（max 合并）
-        self._evidence_engine.register(SymptomKeywordMatch())    # 症状关键词匹配
+        self._evidence_engine.register(SymptomKeywordMatch())    # 症状关键词匹配（ILIKE 降级）
         self._evidence_engine.register(SymptomSeverityMatch())   # 发热成分加成
 
         # safety 维度（min 合并）
@@ -114,6 +115,16 @@ class ScoringPipeline:
                 features, details = self._evidence_engine.evaluate_with_detail(slots, drug)
                 features_list.append(features)
                 evidence_details_list.append(details)
+
+            # ── 3b. 图谱分数覆盖 symptom_match ──
+            # Neo4j 图谱的 (coverage × precision) 分比 ILIKE 文本匹配更精细。
+            # 由于 EvidenceEngine 使用 max 合并策略，ILIKE 的离散高分（0.7/1.0）
+            # 会压过图谱的连续分。这里直接覆盖，确保图谱分优先生效。
+            # 只有 _graph_score 已设置（Neo4j 可用）时才覆盖。
+            for i, drug in enumerate(candidates):
+                gs = getattr(drug, '_graph_score', None)
+                if gs is not None:
+                    features_list[i]["symptom_match"] = min(max(float(gs), 0.0), 1.0)
 
             # ── 4. 批量评分 ──
             result = score_all(
