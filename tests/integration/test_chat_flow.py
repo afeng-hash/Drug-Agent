@@ -76,7 +76,7 @@ async def test_graph_compiles():
     assert "intake" in nodes
     assert "dispatcher" in nodes
     assert "consult" in nodes
-    assert "safety_check" in nodes
+    assert "safety_block" in nodes
     assert "recommend" in nodes
     assert "explain" in nodes
     assert "inventory" in nodes

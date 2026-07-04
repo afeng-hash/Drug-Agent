@@ -17,6 +17,7 @@ Recommend node — 症状 → OTC 药品匹配推荐。
 
 import asyncio
 import json
+import logging
 
 from pydantic import BaseModel, Field
 
@@ -27,6 +28,7 @@ from app.rag.retriever import DrugManualRetriever
 from app.rag.schemas import Chunk
 from app.scorer.pipeline import ScoringPipeline
 
+logger = logging.getLogger(__name__)
 
 # ── LLM 文案生成 Schema ──────────────────────────────────
 
@@ -104,8 +106,17 @@ async def recommend_node(
         category="感冒退烧",
     )
 
-    # ── 3. 排除安全规则过滤的药品 ──
-    candidates = [d for d in candidates if d.generic_name not in excluded_drugs]
+    # ── 3. Neo4j 图谱禁忌过滤 + 合并 safety_block 排除项 ──
+    # 对于每个候选药，通过 Neo4j 查询禁忌关系（病症/人群/过敏成分），
+    # 匹配到用户 profile 则排除该药品。
+    kg_excluded = await _filter_by_kg_contraindications(
+        drug_graph_repo=drug_graph_repo,
+        candidates=candidates,
+        slots=slots,
+    )
+    all_excluded = list(set(excluded_drugs) | set(kg_excluded))
+
+    candidates = [d for d in candidates if d.generic_name not in all_excluded]
     if not candidates:
         return {
             "recommendations": [],
@@ -184,6 +195,61 @@ def _extract_symptom_names(symptoms: list) -> list[str]:
         s.get("name", s) if isinstance(s, dict) else str(s)
         for s in symptoms
     ]
+
+
+async def _filter_by_kg_contraindications(
+    drug_graph_repo,
+    candidates: list,
+    slots: dict,
+) -> list[str]:
+    """通过 Neo4j 知识图谱查询每个候选药的禁忌关系，排除不安全的药品。
+
+    检查三个维度：
+      1. 用户慢性病史 (chronic_conditions) vs 药品禁忌病症 (CONTRAINDICATED_FOR→Condition)
+      2. 特殊人群 (special_population) vs 药品禁忌人群 (CONTRAINDICATED_FOR→Population)
+      3. 过敏史 (allergies) vs 药品成分 (HAS_INGREDIENT→Ingredient)
+
+    Args:
+        drug_graph_repo: DrugGraphRepository or None
+        candidates:      Drug ORM 对象列表
+        slots:           consult_slots
+
+    Returns:
+        需要排除的药品 generic_name 列表
+    """
+    if drug_graph_repo is None:
+        return []
+
+    user_conditions = slots.get("chronic_conditions", []) or []
+    special_population = slots.get("special_population")
+    allergies = slots.get("allergies", []) or []
+
+    # 三个维度都没有数据 → 跳过
+    if not user_conditions and not special_population and not allergies:
+        return []
+
+    excluded: list[str] = []
+    for drug in candidates:
+        try:
+            result = await drug_graph_repo.check_contraindications(
+                drug_name=drug.generic_name,
+                user_conditions=user_conditions,
+                special_population=special_population,
+                allergies=allergies,
+            )
+            if result.has_contraindication:
+                excluded.append(drug.generic_name)
+                logger.info(
+                    "KG excluded %s: conditions=%s, populations=%s, allergens=%s",
+                    drug.generic_name,
+                    result.matched_conditions,
+                    result.matched_populations,
+                    result.matched_allergens,
+                )
+        except Exception:
+            pass  # 单药查询失败不影响整体流程
+
+    return excluded
 
 
 async def _fetch_candidates(

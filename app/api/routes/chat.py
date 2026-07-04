@@ -127,7 +127,7 @@ async def chat(
                     # ── 节点开始 ──
                     node_name = event.get("name", "")
                     if node_name in (
-                        "intake", "dispatcher", "consult", "safety_check",
+                        "intake", "dispatcher", "consult", "safety_block",
                         "recommend", "explain", "inventory", "end",
                     ):
                         yield _sse("node", {"node": node_name, "status": "started"})

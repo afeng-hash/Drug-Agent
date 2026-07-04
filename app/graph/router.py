@@ -32,11 +32,11 @@ def route_after_consult(state: ConversationState) -> str:
       - "done" → 信息充分，进入安全筛查
       - "ask" | 其他 → 信息不够，结束本轮等待用户回复
 
-    可达目标：safety_check / end
+    可达目标：safety_block / end
     """
     next_action = state.get("consult_next_action", "ask")
     if next_action == "done":
-        return "safety_check"   # 症状收集完毕 → 安全检查 → 推荐
+        return "safety_block"   # 症状收集完毕 → 安全拦截 → 推荐
     return "end"                # 需要继续追问 → 结束本轮，前端展示追问语
 
 

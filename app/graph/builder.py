@@ -4,23 +4,19 @@ Graph builder — 组装 LangGraph 状态机。
 这是整个系统的"大脑骨架"——定义节点、边、条件路由，把所有组件串联起来。
 
 流程图：
-  intake ──▶ dispatcher ──▶ consult ──▶ safety_check ──▶ recommend ──▶ inventory ──▶ end
-                 │              │            │
-                 ├── explain ───┤            │
-                 ├── recommend ─┤            │
-                 └── end ───────┘            │
-                                │            │
-                        (ask) → end     (BLOCK) → end
+  intake ──▶ dispatcher ──▶ consult ──▶ safety_block ──▶ recommend ──▶ inventory ──▶ end
+                 │    │         │            │
+                 │    │  (ask)→ end        (BLOCK)→ end
+                 │    │
+                 │    ├── explain ──▶ end
+                 │    ├── recommend ──▶ safety_block  ← dispatcher直接推荐也先过安全拦截
+                 │    └── end
 """
 
 from functools import partial
 
 from langgraph.graph import END, StateGraph
 
-from app.db.repositories.drug import DrugRepository
-from app.db.repositories.inventory import InventoryRepository
-from app.db.repositories.safety_log import SafetyLogRepository
-from app.db.repositories.session import SessionRepository
 from app.graph.nodes.consult import consult_node
 from app.graph.nodes.dispatcher import dispatcher_node
 from app.graph.nodes.end import end_node
@@ -28,7 +24,7 @@ from app.graph.nodes.explain import explain_node
 from app.graph.nodes.intake import intake_node
 from app.graph.nodes.inventory import inventory_node
 from app.graph.nodes.recommend import recommend_node
-from app.graph.nodes.safety_check import safety_check_node
+from app.graph.nodes.safety_check import safety_block_node
 from app.graph.router import (
     route_after_consult,
     route_after_dispatcher,
@@ -91,10 +87,10 @@ def build_graph(
     """症状问诊节点：多轮追问，收集症状槽位"""
 
     graph.add_node(
-        "safety_check",
-        partial(safety_check_node, rule_engine=rule_engine, drug_graph_repo=drug_graph_repo),
+        "safety_block",
+        partial(safety_block_node, rule_engine=rule_engine),
     )
-    """安全筛查节点：规则引擎检查用药禁忌"""
+    """安全拦截节点：仅症状级 BLOCK（高烧/婴儿/孕妇/紧急），不含药品级禁忌"""
 
     # recommend / explain / inventory / end 需要每次新开 DB 会话，
     # 所以用工厂模式（_make_* 闭包），而不是直接传 repo 实例
@@ -137,7 +133,7 @@ def build_graph(
         {
             "consult": "consult",          # 症状问诊
             "explain": "explain",          # 药品解释
-            "recommend": "recommend",      # 直接推荐
+            "recommend": "safety_block",   # 直接推荐 → 先过安全拦截
             "end": "end",                  # 结束
         },
     )
@@ -147,17 +143,17 @@ def build_graph(
         "consult",
         route_after_consult,              # 条件函数：读 consult_next_action
         {
-            "safety_check": "safety_check",  # done → 进入安全检查
+            "safety_block": "safety_block",  # done → 进入安全拦截
             "end": "end",                    # ask → 等待用户下一轮输入
         },
     )
 
-    # safety_check → 2 路条件分支
+    # safety_block → 2 路条件分支
     graph.add_conditional_edges(
-        "safety_check",
+        "safety_block",
         route_after_safety,               # 条件函数：读 safety_result.verdict
         {
-            "recommend": "recommend",      # PASS / FILTER → 继续推荐
+            "recommend": "recommend",      # PASS → 继续推荐
             "end": "end",                  # BLOCK → 终止，返回警告
         },
     )

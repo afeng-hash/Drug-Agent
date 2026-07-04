@@ -164,10 +164,10 @@ class ConversationState(TypedDict):
 
     可选值：
       - "ask"  ← 信息还不够，需要继续追问（本轮只输出追问语，等用户下一轮回复）
-      - "done" ← 信息充分，进入 safety_check → recommend → inventory 链路
+      - "done" ← 信息充分，进入 safety_block → recommend → inventory 链路
 
     来源：Consult Agent
-    消费：route_after_consult() 决定走 safety_check 还是 end
+    消费：route_after_consult() 决定走 safety_block 还是 end
     """
 
     consult_rounds: int
@@ -288,7 +288,7 @@ class ConversationState(TypedDict):
     结构（每个元素）：
       {"node": "recommend", "count": 3}
       {"node": "dispatcher", "route": "consult", "intent": "describe_symptom"}
-      {"node": "safety_check", "verdict": "PASS", "triggered_rules": []}
+      {"node": "safety_block", "verdict": "PASS", "triggered_rules": []}
       {"node": "end", "status": "ok"}
 
     用途：
