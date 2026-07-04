@@ -8,7 +8,7 @@ from app.rules.engine import RuleEngine
 
 @pytest.fixture
 def rule_engine() -> RuleEngine:
-    """A RuleEngine with all 7 rules registered."""
+    """A RuleEngine with all 5 BLOCK rules registered."""
     engine = RuleEngine()
     register_all_rules(engine)
     return engine
@@ -66,31 +66,6 @@ def pregnant_fever_slots(empty_slots) -> dict:
         "duration_days": 1,
         "age": 30,
         "special_population": "pregnant",
-    }
-
-
-@pytest.fixture
-def child_fever_slots(empty_slots) -> dict:
-    """Child with fever — should trigger R7 (aspirin FILTER)."""
-    return {
-        **empty_slots,
-        "symptoms": [{"name": "发热"}],
-        "temperature": 38.5,
-        "duration_days": 2,
-        "age": 8,
-    }
-
-
-@pytest.fixture
-def ibuprofen_allergy_slots(empty_slots) -> dict:
-    """User allergic to ibuprofen — should trigger R6."""
-    return {
-        **empty_slots,
-        "symptoms": [{"name": "头痛"}],
-        "temperature": 37.5,
-        "duration_days": 1,
-        "age": 25,
-        "allergies": ["布洛芬"],
     }
 
 

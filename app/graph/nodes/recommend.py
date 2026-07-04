@@ -81,9 +81,6 @@ async def recommend_node(
     slots = state.get("consult_slots", {})
     summary = state.get("consult_summary", "")
     session_id = state.get("session_id", "")
-    safety_result = state.get("safety_result") or {}
-    excluded_drugs = safety_result.get("excluded_drugs", [])
-
     # ── 1. 提取症状名称并分配权重 ──
     # 主诉症状 weight=1.0，附加症状 weight=0.5
     symptoms = slots.get("symptoms", [])
@@ -106,17 +103,14 @@ async def recommend_node(
         category="感冒退烧",
     )
 
-    # ── 3. Neo4j 图谱禁忌过滤 + 合并 safety_block 排除项 ──
-    # 对于每个候选药，通过 Neo4j 查询禁忌关系（病症/人群/过敏成分），
-    # 匹配到用户 profile 则排除该药品。
+    # ── 3. Neo4j 图谱禁忌过滤 ──
     kg_excluded = await _filter_by_kg_contraindications(
         drug_graph_repo=drug_graph_repo,
         candidates=candidates,
         slots=slots,
     )
-    all_excluded = list(set(excluded_drugs) | set(kg_excluded))
 
-    candidates = [d for d in candidates if d.generic_name not in all_excluded]
+    candidates = [d for d in candidates if d.generic_name not in kg_excluded]
     if not candidates:
         return {
             "recommendations": [],

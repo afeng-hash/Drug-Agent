@@ -200,26 +200,28 @@ class ConversationState(TypedDict):
     # ────────────────────────────────────────────
 
     safety_result: dict[str, Any] | None
-    """【安全筛查结果】规则引擎对当前症状 + 候选药品的检查结论。
+    """【安全筛查结果】规则引擎对当前症状的检查结论。
 
     结构：
       {
-        "verdict": "PASS" | "BLOCK" | "FILTER",
-          # PASS   ← 全部通过，放心推荐
-          # BLOCK  ← 触发拦截规则，直接终止推荐流程，返回就医警告
-          # FILTER ← 排除了部分药品（如过敏），其余照常推荐
+        "verdict": "PASS" | "BLOCK",
+          # PASS  ← 全部通过，继续推荐
+          # BLOCK ← 触发拦截规则，直接终止推荐流程，返回就医警告
         "triggered_rules": [
-          {"rule_id": "r6_drug_allergy", "action": "FILTER", "reason": "用户对阿司匹林过敏"}
+          {"rule_id": "R1", "action": "BLOCK", "reason": "体温 39.5°C..."}
         ],
-        "excluded_drugs": ["阿司匹林"],  # ← FILTER 时排除的药品通用名列表
-        "message": "⚠️ 检测到..."        # ← BLOCK 时的警告文案（直接展示给用户）
+        "excluded_drugs": [],   # [已废弃] 药品级过滤已移到 Neo4j
+        "message": "⚠️ 检测到..."  # ← BLOCK 时的警告文案（直接展示给用户）
       }
 
-    来源：SafetyCheck 节点（调用 RuleEngine.check()）
+    来源：safety_block 节点（调用 RuleEngine.check()）
     消费：
-      - Recommend 节点用 excluded_drugs 过滤候选药品
+      - router.py 的 route_after_safety() 根据 verdict 决定路由
       - End 节点写入 safety_logs 表做审计
       - SSE 通过 "safety" 事件推送给前端
+
+    注意：药品级别的禁忌过滤（原 R6/R7）已移到 recommend_node，
+    由 Neo4j 知识图谱 _filter_by_kg_contraindications() 完成。
     """
 
     # ────────────────────────────────────────────
@@ -240,7 +242,7 @@ class ConversationState(TypedDict):
     特征：
       - 长度 1-3 个（LLM 在候选药品中排 Top 3）
       - 按 score 降序排列（最好的在最前）
-      - 已排除 safety_result.excluded_drugs 中的药品
+      - 已由 Neo4j 知识图谱排除禁忌药品
 
     来源：Recommend 节点（LLM 调用 + DB 查询）
     消费：

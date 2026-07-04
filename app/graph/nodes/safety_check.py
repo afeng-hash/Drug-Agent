@@ -32,7 +32,7 @@ async def safety_block_node(
 
     触发任一规则 → verdict=BLOCK，直接终止推荐流程。
 
-    不执行 FILTER 阶段——药品禁忌过滤已移到 recommend_node。
+    药品禁忌过滤已移到 recommend_node 的 Neo4j 图谱查询。
 
     Args:
         state:       当前会话状态
@@ -46,14 +46,11 @@ async def safety_block_node(
     """
     slots = state.get("consult_slots", {})
 
-    # 不传 candidate_drugs —— BLOCK 阶段不需要药品列表
-    # （FILTER 阶段需要药品列表的规则已移到 recommend_node）
-    result = rule_engine.check(slots, drug_names=[])
+    result = rule_engine.check(slots)
 
     safety_result = {
         "verdict": result.verdict,
         "triggered_rules": result.triggered_rules,
-        "excluded_drugs": [],
         "message": result.message,
     }
 

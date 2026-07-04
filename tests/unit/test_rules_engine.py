@@ -1,4 +1,4 @@
-"""Unit tests for the safety rule engine and all 7 rules."""
+"""Unit tests for the safety rule engine and 5 BLOCK rules."""
 
 import pytest
 
@@ -12,24 +12,23 @@ class TestRuleEngine:
         assert len(result.triggered_rules) == 0
 
     def test_short_circuit_on_block(self, rule_engine):
-        """BLOCK rule should prevent FILTER rules from running."""
+        """首个 BLOCK 规则触发后应立即短路线返回，不再评估后续规则。"""
         slots = {
             "symptoms": [{"name": "发热"}],
             "temperature": 39.5,
             "duration_days": 4,
-            "age": 8,  # This would trigger R7 (FILTER) but R1 (BLOCK) should short-circuit
-            "allergies": ["布洛芬"],
+            "age": 8,
+            "allergies": [],
             "other_symptoms": [],
             "medications_taken": [],
             "special_population": None,
             "chronic_conditions": [],
-            "allergies": [],
         }
-        result = rule_engine.check(slots, ["布洛芬", "阿司匹林"])
+        result = rule_engine.check(slots)
         assert result.verdict == "BLOCK"
-        # R7 (FILTER) should NOT have triggered due to short-circuit
-        filter_rules = [r for r in result.triggered_rules if r["action"] == "FILTER"]
-        assert len(filter_rules) == 0
+        # 应该只有一个 BLOCK 规则触发（R1），后续规则被短路
+        assert len(result.triggered_rules) == 1
+        assert result.triggered_rules[0]["rule_id"] == "R1"
 
 
 class TestR1HighFever:
@@ -116,35 +115,6 @@ class TestR5SevereAllergy:
         result = rule_engine.check(slots)
         assert result.verdict == "BLOCK"
         assert any(r["rule_id"] == "R5" for r in result.triggered_rules)
-
-
-class TestR6DrugAllergy:
-    def test_trigger_ibuprofen(self, rule_engine, ibuprofen_allergy_slots):
-        result = rule_engine.check(ibuprofen_allergy_slots, ["布洛芬", "对乙酰氨基酚"])
-        assert result.verdict == "FILTER"
-        assert "布洛芬" in result.excluded_drugs
-        assert "对乙酰氨基酚" not in result.excluded_drugs
-
-    def test_not_trigger_no_allergy(self, rule_engine, normal_adult_slots):
-        result = rule_engine.check(normal_adult_slots, ["布洛芬"])
-        assert result.verdict == "PASS"
-
-
-class TestR7ChildAspirin:
-    def test_filter(self, rule_engine, child_fever_slots):
-        result = rule_engine.check(child_fever_slots, ["阿司匹林", "布洛芬", "对乙酰氨基酚"])
-        assert result.verdict == "FILTER"
-        assert "阿司匹林" in result.excluded_drugs
-        assert "布洛芬" not in result.excluded_drugs
-
-    def test_not_trigger_adult(self, rule_engine, normal_adult_slots):
-        result = rule_engine.check(normal_adult_slots, ["阿司匹林"])
-        assert result.verdict == "PASS"
-
-    def test_not_trigger_no_aspirin(self, rule_engine, child_fever_slots):
-        result = rule_engine.check(child_fever_slots, ["布洛芬", "对乙酰氨基酚"])
-        # R7 triggers (FILTER) but no aspirin drugs to exclude
-        assert len(result.excluded_drugs) == 0
 
 
 class TestRulePluginArchitecture:

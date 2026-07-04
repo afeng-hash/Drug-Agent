@@ -41,11 +41,11 @@ def route_after_consult(state: ConversationState) -> str:
 
 
 def route_after_safety(state: ConversationState) -> str:
-    """SafetyCheck 节点之后：根据安全结论决定下一步。
+    """safety_block 节点之后：根据安全结论决定下一步。
 
     读取 safety_result.verdict：
       - "BLOCK" → 存在危险信号，终止推荐，直接返回就医警告
-      - "PASS" / "FILTER" / 其他 → 安全或仅排除部分药品，继续推荐流程
+      - "PASS"  → 安全，继续推荐流程
 
     可达目标：recommend / end
     """
@@ -53,4 +53,4 @@ def route_after_safety(state: ConversationState) -> str:
     verdict = safety_result.get("verdict", "PASS")
     if verdict == "BLOCK":
         return "end"            # 拦截 → 不进入推荐
-    return "recommend"          # 通过/部分排除 → 继续推荐
+    return "recommend"          # 通过 → 继续推荐
