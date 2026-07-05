@@ -101,6 +101,7 @@ async def run_consult(
     full_messages = [system_msg, context_msg] + messages[-10:]
 
     # ── 调用 LLM ──
+    #todo
     result = await llm_client.generate_structured(
         messages=full_messages,
         schema=ConsultResult,

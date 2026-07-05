@@ -77,6 +77,12 @@ async def lifespan(app: FastAPI):
     drug_graph_repo = DrugGraphRepository(neo4j_client)
     app.state.drug_graph_repo = drug_graph_repo
 
+    # ── 症状标准化词表 ──
+    from app.normalizer.vocabulary import Neo4jVocabularySource
+    vocab_source = Neo4jVocabularySource(neo4j_client)
+    await vocab_source.load()
+    app.state.vocab_source = vocab_source
+
     # ── 规则引擎（注册所有安全规则） ──
     rule_engine = RuleEngine()
     register_all_rules(rule_engine)
@@ -125,6 +131,7 @@ async def lifespan(app: FastAPI):
         retriever=retriever,
         scoring_pipeline=scoring_pipeline,
         drug_graph_repo=drug_graph_repo,
+        vocab_source=vocab_source,
         max_consult_rounds=settings.max_consult_rounds,
     )
     app.state.graph = graph

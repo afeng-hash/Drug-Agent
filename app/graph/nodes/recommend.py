@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from app.db.repositories.drug import DrugRepository
 from app.db.repositories.weight_config import WeightConfigRepository
 from app.llm.client import LLMClient
+from app.normalizer import SymptomNormalizer
 from app.rag.retriever import DrugManualRetriever
 from app.rag.schemas import Chunk
 from app.scorer.pipeline import ScoringPipeline
@@ -64,6 +65,7 @@ async def recommend_node(
     retriever: DrugManualRetriever,
     scoring_pipeline: ScoringPipeline,
     drug_graph_repo=None,
+    vocab_source=None,
 ) -> dict:
     """执行药品推荐：评分排序 + RAG 说明 + LLM 文案。
 
@@ -75,6 +77,7 @@ async def recommend_node(
         retriever:         Milvus 说明书检索器
         scoring_pipeline:  评分排序管线
         drug_graph_repo:   Neo4j 图谱仓库（主查询路径，None 时降级到 PG）
+        vocab_source:      症状词表（VocabularySource，已加载）
 
     Returns:
         state 更新 dict。
@@ -93,6 +96,25 @@ async def recommend_node(
         + [{"name": n, "weight": 0.5} for n in secondary_names]
     )
     symptom_names = primary_names + secondary_names
+
+    # ── 1.5. 症状标准化：自由文本 → KG 标准症状名 ──
+    if symptom_weights and vocab_source is not None:
+        normalizer = SymptomNormalizer(vocab=vocab_source, llm_client=llm_client)
+        raw_names = [sw["name"] for sw in symptom_weights]
+        norm_result = await normalizer.normalize(raw_names)
+        for sw, ns in zip(symptom_weights, norm_result.results):
+            sw["_raw_name"] = sw["name"]   # 保留原始名（供调试）
+            sw["name"] = ns.standard if ns.standard else ns.raw
+        logger.info(
+            "Symptom normalization: %d symptoms, methods=%s, "
+            "llm_calls=%d, cache_hits=%d, discarded=%d, %.2fms",
+            len(raw_names),
+            [ns.method for ns in norm_result.results],
+            norm_result.llm_calls,
+            norm_result.cache_hits,
+            norm_result.discarded_count,
+            norm_result.total_time_ms,
+        )
 
     # ── 2. 查询候选药品（KG 唯一数据源）──
     candidates = await _fetch_candidates(
