@@ -85,17 +85,11 @@ async def recommend_node(
     slots = state.get("consult_slots", {})
     summary = state.get("consult_summary", "")
     session_id = state.get("session_id", "")
-    # ── 1. 提取症状名称并分配权重 ──
-    # 主诉症状 weight=1.0，附加症状 weight=0.5
+    # ── 1. 提取症状名称（所有症状等权，不区分主诉/伴随）──
     symptoms = slots.get("symptoms", [])
-    primary_names = _extract_symptom_names(symptoms)
-    secondary_names = _extract_symptom_names(slots.get("other_symptoms", []))
-
-    symptom_weights = (
-        [{"name": n, "weight": 1.0} for n in primary_names]
-        + [{"name": n, "weight": 0.5} for n in secondary_names]
-    )
-    symptom_names = primary_names + secondary_names
+    symptom_names_raw = _extract_symptom_names(symptoms)
+    symptom_weights = [{"name": n, "weight": 1.0} for n in symptom_names_raw]
+    symptom_names = list(symptom_names_raw)
 
     # ── 1.5. 症状标准化：自由文本 → KG 标准症状名 ──
     if symptom_weights and vocab_source is not None:
@@ -115,6 +109,23 @@ async def recommend_node(
             norm_result.discarded_count,
             norm_result.total_time_ms,
         )
+
+    # ── 1.6 去重：同一标准症状名只保留一次 ──
+    seen_names: set[str] = set()
+    deduped_weights: list[dict] = []
+    for sw in symptom_weights:
+        name = sw["name"]
+        if name and name not in seen_names:
+            seen_names.add(name)
+            deduped_weights.append(sw)
+    if len(deduped_weights) < len(symptom_weights):
+        logger.info(
+            "Symptom dedup: %d → %d (removed %d duplicates)",
+            len(symptom_weights), len(deduped_weights),
+            len(symptom_weights) - len(deduped_weights),
+        )
+        symptom_weights = deduped_weights
+        symptom_names = [sw["name"] for sw in symptom_weights]
 
     # ── 2. 查询候选药品（KG 唯一数据源）──
     candidates = await _fetch_candidates(

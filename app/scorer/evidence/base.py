@@ -85,7 +85,6 @@ class BaseEvidence(ABC):
               - age (int|None)                ← 年龄
               - chronic_conditions (list[str])← 慢性病史
               - allergies (list[str])         ← 过敏史
-              - other_symptoms (list[str])    ← 伴随症状
 
             drug: Drug ORM 实例。可用字段：
               - generic_name, brand_names     ← 通用名、商品名

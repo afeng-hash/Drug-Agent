@@ -19,7 +19,6 @@ class TestRuleEngine:
             "duration_days": 4,
             "age": 8,
             "allergies": [],
-            "other_symptoms": [],
             "medications_taken": [],
             "special_population": None,
             "chronic_conditions": [],
@@ -99,19 +98,19 @@ class TestR4EmergencySigns:
         assert any(r["rule_id"] == "R4" for r in result.triggered_rules)
 
     def test_trigger_chest_pain(self, rule_engine, empty_slots):
-        slots = {**empty_slots, "other_symptoms": ["胸痛"]}
+        slots = {**empty_slots, "symptoms": [{"name": "胸痛"}]}
         result = rule_engine.check(slots)
         assert result.verdict == "BLOCK"
 
     def test_not_trigger_normal_symptoms(self, rule_engine, empty_slots):
-        slots = {**empty_slots, "other_symptoms": ["头痛", "流鼻涕"]}
+        slots = {**empty_slots, "symptoms": [{"name": "头痛"}, {"name": "流鼻涕"}]}
         result = rule_engine.check(slots)
         assert result.verdict == "PASS"
 
 
 class TestR5SevereAllergy:
     def test_trigger(self, rule_engine, empty_slots):
-        slots = {**empty_slots, "other_symptoms": ["全身皮疹"]}
+        slots = {**empty_slots, "symptoms": [{"name": "全身皮疹"}]}
         result = rule_engine.check(slots)
         assert result.verdict == "BLOCK"
         assert any(r["rule_id"] == "R5" for r in result.triggered_rules)

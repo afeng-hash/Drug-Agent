@@ -25,7 +25,6 @@ async def test_dispatcher_routes_symptom_to_consult():
             "age": None,
             "chronic_conditions": [],
             "allergies": [],
-            "other_symptoms": [],
         },
         "dispatcher_result": {},
     }
@@ -59,7 +58,6 @@ async def test_dispatcher_routes_drug_query_to_explain():
             "age": None,
             "chronic_conditions": [],
             "allergies": [],
-            "other_symptoms": [],
         },
         "dispatcher_result": {},
     }

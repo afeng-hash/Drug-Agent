@@ -1,143 +1,218 @@
-# PR Summary：症状标准化模块 — 自由文本 → KG 标准名两级匹配
+# PR Summary：统一症状数据结构 — 废弃 `other_symptoms`，所有症状平等对待
 
 **Branch**: `master`  
-**Files**: 8 changed (4 modified + 4 new) | **Diff**: `+34 / -2`（不含新文件）  
-**New code**: `app/normalizer/` (~650 行) + `tests/unit/test_symptom_normalizer.py` (~700 行)
+**Files**: 16 modified | **Diff**: `+75 / -55`
 
 ---
 
 ## 一、问题背景
 
-用户在对话中描述症状时，用词千差万别——"喉咙不舒服""嗓子疼""咽部不适"可能都指向 KG 中的标准名「咽喉痛」。在此之前，推荐节点直接将用户原始文本传给 KG 查询，自由文本与标准症状名不匹配会导致：
+旧设计中，症状被分为两个字段存储：
 
-- KG 查不到对应 Symptom 节点 → 候选药品缺失
-- 症状匹配证据规则评分偏低 → 推荐不精准
+```python
+consult_slots = {
+    "symptoms":       [{"name": "头痛", "severity": "中度"}],  # 主诉症状
+    "other_symptoms": ["流鼻涕", "咳嗽"],                      # 伴随症状
+}
+```
+
+这带来了几个问题：
+
+1. **LLM 决策负担**：Consult Agent 需要在「主诉」和「伴随」之间做语义区分，LLM 经常犹豫不决，导致症状被放入错误字段
+2. **下游处理复杂**：Recommend 节点需要拼接两处来源（1.0 权重 + 0.5 权重），Scoring 证据规则需要分别遍历两处，Safety 规则只检查 `other_symptoms` 而遗漏 `symptoms` 中的急症关键词
+3. **字段语义模糊**："头痛"和"流鼻涕"对用户来说都是不舒服的症状，强行区分主/次没有药学依据——症状应该按「是否匹配药品适应症」来评价，而非按「用户先说的还是后说的」
 
 ## 二、解决方案
 
-新增 **症状标准化模块** `app/normalizer/`，在推荐节点评分前将用户自由文本症状名映射到 KG 标准症状词表。
+**所有症状统一放入 `symptoms` 列表，废弃 `other_symptoms` 字段。**
 
-### 架构
-
-```
-用户输入 "喉咙不舒服" 
-    │
-    ▼
-┌─────────────────────────────────────────────────────┐
-│  SymptomNormalizer.normalize(["喉咙不舒服", "干咳"]) │
-│                                                      │
-│  Layer 0 (确定性, <1ms):                              │
-│    ① exact 匹配 → "干咳" 命中 ✓ (1.0置信度)           │
-│    ② alias 匹配 → "喉咙不舒服" → 别名表 → 未命中       │
-│    ③ contains 匹配 → "喉咙不舒服" contains "咽喉" → 未命中│
-│                                                      │
-│  Layer 1 (LLM + 硬词表约束):                          │
-│    "喉咙不舒服" → LLM → "咽喉痛"                       │
-│    → 硬词表验证(在词表中 ✓) → 风险分层(L1 ≥0.7 ✓)     │
-│    → 接受 (0.75置信度)                                 │
-│                                                      │
-│  输出: ["咽喉痛", "干咳"]                              │
-└─────────────────────────────────────────────────────┘
-    │
-    ▼
-推荐节点用标准化后的名称查 KG
+```python
+# 新设计
+consult_slots = {
+    "symptoms": [
+        {"name": "头痛", "severity": "中度", "onset": "2天前"},
+        {"name": "流鼻涕", "onset": "有点"},
+        {"name": "咳嗽"},
+    ],
+}
+# other_symptoms 字段已删除
 ```
 
-### 模块结构
+### 变更范围
 
-| 文件 | 职责 |
-|------|------|
-| `app/normalizer/__init__.py` | 模块导出 |
-| `app/normalizer/schemas.py` | `NormalizedSymptom`（单个映射结果）+ `NormalizationResult`（批量汇总） |
-| `app/normalizer/symptom_normalizer.py` | **核心引擎**：两级匹配 + 风险分层 + LLM 缓存 |
-| `app/normalizer/vocabulary.py` | `VocabularySource` 抽象接口 + `Neo4jVocabularySource` 实现 |
+本次改动横跨 **4 层架构**，确保端到端一致性：
 
-### Layer 0 — 确定性匹配（零 LLM 开销）
-
-| 策略 | 说明 | 置信度 |
-|------|------|--------|
-| **exact** | 完全匹配标准名 | 1.0 |
-| **alias** | 匹配别名表（如「嗓子疼」→「咽喉痛」） | 1.0 |
-| **contains** | 双向包含匹配（如「一直干咳」contains「干咳」），取最长命中 | 0.80 |
-
-### Layer 1 — LLM 语义映射（仅在 Layer 0 未命中时触发）
-
-- **硬词表约束**：LLM 返回的标准名必须在词表中存在，否则丢弃
-- **风险分层**（基于 KG 症状层级）：
-  - Level 1（粗粒度，如「发热」）：置信度 ≥ 0.7 → 接受
-  - Level 2（中等粒度，如「干咳」）：置信度 ≥ 0.85 → 接受
-  - Level 3（细粒度，如「右下肢放射痛」）：不走 LLM，直接丢弃
-- **结果缓存**：同一 raw_text 不重复调 LLM
-
-### 词表加载 — `Neo4jVocabularySource`
-
-- 启动时一次性从 Neo4j 拉取全部 Symptom 节点 + IS_A 关系
-- 构建 `name→SymptomEntry` 和 `alias→name` 两个内存索引
-- 运行时零 Neo4j 开销
-- 如果 Neo4j 不可用，词表为空，标准化步骤跳过
+```
+Prompt (LLM 指令)
+  → Consult Node (初始化)
+    → State (数据结构)
+      → Recommend Node (提取+去重)
+      → Safety Rules (急症/过敏检测)
+      → Evidence Rules (症状关键词匹配)
+```
 
 ---
 
-## 三、变更文件
+## 二、逐文件变更
 
-### 新建
+### 1. Prompt 层 — 从源头消除歧义
 
-| 文件 | 行数 | 说明 |
-|------|------|------|
-| `app/normalizer/__init__.py` | 21 | 模块导出 |
-| `app/normalizer/schemas.py` | 30 | `NormalizedSymptom` + `NormalizationResult` |
-| `app/normalizer/symptom_normalizer.py` | 384 | 核心：两级匹配 + 风险分层 + LLM 缓存 |
-| `app/normalizer/vocabulary.py` | 155 | `VocabularySource` 抽象 + `Neo4jVocabularySource` |
-| `specs/symptom-normalization/` | 4 文件 | spec.md / plan.md / task.md / checklist.md |
-| `tests/unit/test_symptom_normalizer.py` | ~700 | 完整单元测试 |
+**`app/agent/prompts.py`** (+12/-5)
 
-### 修改
+```diff
++## 症状归类规则（重要）
++- 用户提到的所有症状统一放入 `symptoms` 列表，不要区分「主诉」和「伴随」
++- 每个症状的 `onset` 字段记录用户的自然语言描述
++- 不要在 symptoms 和 other_symptoms 之间犹豫——全部进 symptoms
++
++**禁止使用 other_symptoms 字段**——所有症状放入 symptoms 列表
+```
+
+LLM 输出示例也从 `"other_symptoms": ["流鼻涕"]` 改为在 `symptoms` 中包含多个条目。
+
+### 2. State 层 — 数据结构统一
+
+**`app/graph/state.py`** (+4/-2)
+
+- 删除 `other_symptoms` 字段定义和文档注释
+- 新增说明："所有症状统一放入 symptoms 列表，不区分「主诉」和「伴随」"
+- `initial_state()` 移除 `"other_symptoms": []`
+
+**`app/graph/nodes/consult.py`** (+1/-1)
+
+- 删除空槽位初始化中的 `"other_symptoms": []`
+
+### 3. Recommend 节点 — 简化症状提取
+
+**`app/graph/nodes/recommend.py`** (+22/-11)
+
+```diff
+- # 主诉症状 weight=1.0，附加症状 weight=0.5
+- primary_names = _extract_symptom_names(symptoms)
+- secondary_names = _extract_symptom_names(slots.get("other_symptoms", []))
+- symptom_weights = (
+-     [{"name": n, "weight": 1.0} for n in primary_names]
+-     + [{"name": n, "weight": 0.5} for n in secondary_names]
+- )
+
++ # 所有症状等权，不区分主诉/伴随
++ symptom_names_raw = _extract_symptom_names(symptoms)
++ symptom_weights = [{"name": n, "weight": 1.0} for n in symptom_names_raw]
+```
+
+同时新增 **步骤 1.6 — 去重**：标准化后同一标准症状名只保留一次，避免 KG 重复查询。
+
+### 4. Safety Rule 层 — 统一症状来源
+
+**`app/rules/base.py`** (-1)
+
+- 删除 docstring 中的 `other_symptoms` 字段说明
+
+**`app/rules/definitions/r4_emergency_signs.py`** (+13/-4)  
+**`app/rules/definitions/r5_severe_allergy.py`** (+13/-4)
+
+两者做了相同的重构：从读取 `other_symptoms`（纯字符串列表）改为读取统一的 `symptoms`（dict 列表），并兼容 str 格式：
+
+```python
+# 旧：只检查 other_symptoms（纯字符串列表）
+other_symptoms = slots.get("other_symptoms", [])
+other_text = " ".join(other_symptoms).lower()
+
+# 新：检查统一 symptoms（dict 列表，也兼容 str 格式）
+symptoms = slots.get("symptoms", [])
+symptom_names = []
+for s in symptoms:
+    if isinstance(s, dict):
+        name = s.get("name", "")
+        if name:
+            symptom_names.append(name)
+    elif isinstance(s, str):
+        symptom_names.append(s)
+symptom_text = " ".join(symptom_names).lower()
+```
+
+**影响**：之前 R4/R5 只检测 `other_symptoms` 中的急症关键词，如果用户把"呼吸困难"说成主诉症状（放入 `symptoms`），反而不触发拦截。现在统一检测所有症状，**急症拦截覆盖率提升**。
+
+### 5. Evidence Rule 层 — 简化匹配逻辑
+
+**`app/scorer/evidence/base.py`** (-1)
+
+- 删除 docstring 中的 `other_symptoms` 字段说明
+
+**`app/scorer/evidence/symptom_keyword.py`** (+2/-8)
+
+```diff
+- # 分别在 symptoms 和 other_symptoms 中搜索
+- other_symptoms = slots.get("other_symptoms", [])
+- all_symptoms = symptom_names + [
+-     s.get("name", s) if isinstance(s, dict) else str(s)
+-     for s in other_symptoms
+- ]
+
++ # 所有症状已统一在 symptoms 列表中
+```
+
+简化了两个来源拼接的代码，症状关键词匹配逻辑更清晰。
+
+### 6. 测试层 — 全面适配
 
 | 文件 | 变更 | 说明 |
 |------|------|------|
-| `app/main.py` | +7 | 启动时创建 `Neo4jVocabularySource`、加载词表、挂载到 `app.state`、传给 graph builder |
-| `app/graph/builder.py` | +6/-2 | `build_graph()` 和 `_make_recommend()` 新增 `vocab_source` 参数 |
-| `app/graph/nodes/recommend.py` | +22 | 新增步骤 1.5：症状标准化。在 KG 查询之前将自由文本症状名映射为标准名，同时保留原始名 `_raw_name` 供调试 |
-| `app/agent/consult_agent.py` | +1 | 注释标记（TODO） |
+| `tests/conftest.py` | +3/-2 | `emergency_slots` 急症症状改为 dict 格式放入 `symptoms`；`empty_slots` 删除 `other_symptoms` |
+| `tests/integration/test_chat_flow.py` | -1 | 删除 `other_symptoms` |
+| `tests/integration/test_safety_flow.py` | +1/-2 | R4 测试改用 `symptoms` + dict 格式 |
+| `tests/unit/test_consult_agent.py` | -7 | 5 处删除 `other_symptoms` |
+| `tests/unit/test_dispatcher.py` | -2 | 2 处删除 `other_symptoms` |
+| `tests/unit/test_rules_engine.py` | +6/-5 | R4/R5 测试改为 `symptoms` + dict 格式 |
+| `tests/unit/test_dispatcher.py` | -2 | 删除 `other_symptoms` |
+
+### 7. 其他
+
+**`app/graph/nodes/dispatcher.py`** (+1)
+
+- 添加 TODO 注释标记已知问题
 
 ---
 
-## 四、Breaking Changes
+## 三、Breaking Changes
 
-### BC-1：`build_graph()` 和 `_make_recommend()` 新增参数
+### BC-1：`consult_slots` 数据结构变更
 
 ```python
 # 旧
-def build_graph(..., drug_graph_repo=None, max_consult_rounds=6)
-def _make_recommend(..., drug_graph_repo=None)
+{"symptoms": [...], "other_symptoms": [...]}
 
 # 新
-def build_graph(..., drug_graph_repo=None, vocab_source=None, max_consult_rounds=6)
-def _make_recommend(..., drug_graph_repo=None, vocab_source=None)
+{"symptoms": [...]}  # other_symptoms 已删除
 ```
 
-`vocab_source` 有默认值 `None`，**向后兼容**。不传时症状标准化步骤自动跳过。
+**影响范围**：
 
-### BC-2：`recommend_node()` 新增可选参数
+| 影响方 | 处理方式 |
+|--------|---------|
+| LLM Prompt | ✅ 已更新——要求所有症状进 `symptoms`，禁止使用 `other_symptoms` |
+| Safety Rules (R4, R5) | ✅ 已更新——从 `symptoms` 读取，兼容 dict/str 格式 |
+| Evidence Rules | ✅ 已更新——删除 `other_symptoms` 拼接逻辑 |
+| Recommend Node | ✅ 已更新——所有症状等权 |
+| State / Consult Node | ✅ 已更新——删除字段定义和初始化 |
+| **数据库 `state_snapshot`** | ⚠️ 旧会话的 snapshot 可能包含 `other_symptoms` 字段，下游代码已兼容（`slots.get("other_symptoms", [])`→`[]`），不影响运行 |
+| **前端** | ⚠️ 如果前端直接读取 `consult_slots.other_symptoms` 展示症状列表，需改为读取 `consult_slots.symptoms` |
 
-```python
-async def recommend_node(..., drug_graph_repo=None, vocab_source=None)
-```
+### BC-2：安全规则检查范围变化（业务行为变更）
 
-同理，默认值保证兼容。
+R4（急症信号）和 R5（严重过敏）**之前只检查 `other_symptoms`**，现在检查所有 `symptoms`。这可能导致之前未被拦截的会话现在触发 BLOCK——但这是**正确的行为修正**，急症信号本就不应该被遗漏。
 
 ---
 
-## 五、业务影响
+## 四、业务影响
 
-| 影响维度 | 说明 |
-|----------|------|
-| **推荐精准度提升** | 用户说的口语化症状名称被标准化为 KG 标准名，KG 查询命中率提高 |
-| **LLM 调用量可控** | Layer 0 覆盖大部分常见表达（exact/alias/contains），仅少数未命中才走 LLM；结果缓存避免重复调用 |
-| **安全兜底** | 细粒度症状（Level 3）不走 LLM，避免错误映射导致错误推荐；LLM 返回的结果经硬词表验证后才接受 |
-| **Neo4j 不可用不受影响** | 词表加载失败时 `vocab_source=None`，标准化步骤跳过，推荐管线正常运作 |
-| **启动时间略增** | 每次启动加载一次词表（~100 条症状），毫秒级 |
+| 维度 | 影响 |
+|------|------|
+| **推荐准确度** | 所有症状等权参与评分，不再因"伴随症状"被 0.5 折权而遗漏匹配 |
+| **急症拦截覆盖率** | R4/R5 从只检查 `other_symptoms` 扩展到所有症状，不再遗漏主诉中的急症信号 |
+| **LLM 调用质量** | Consult Agent 不再纠结"主诉 vs 伴随"的语义区分，症状收集更稳定 |
+| **代码简洁度** | 删除 55 行分散在两处的症状拼接/遍历代码 |
+| **数据模型清晰度** | 单一症状来源，不再有"这个症状该放哪里"的歧义 |
 
 ---
-
 

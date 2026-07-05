@@ -21,7 +21,6 @@ async def test_consult_asks_when_slots_insufficient():
             "age": None,
             "chronic_conditions": [],
             "allergies": [],
-            "other_symptoms": ["流鼻涕"],
         },
         response="您有没有量体温？发烧吗？",
         next_action="ask",
@@ -40,7 +39,6 @@ async def test_consult_asks_when_slots_insufficient():
         "age": None,
         "chronic_conditions": [],
         "allergies": [],
-        "other_symptoms": [],
     }
 
     result = await run_consult(llm_client, messages, current_slots, max_rounds=6)
@@ -65,7 +63,6 @@ async def test_consult_done_when_slots_sufficient():
             "age": 28,
             "chronic_conditions": [],
             "allergies": [],
-            "other_symptoms": ["流鼻涕"],
         },
         response="好的，我已经了解了您的情况，让我为您推荐药品。",
         next_action="done",
@@ -86,7 +83,6 @@ async def test_consult_done_when_slots_sufficient():
         "age": 28,
         "chronic_conditions": [],
         "allergies": [],
-        "other_symptoms": [],
     }
 
     result = await run_consult(llm_client, messages, current_slots, max_rounds=6)
@@ -108,7 +104,6 @@ async def test_consult_forces_done_at_max_rounds():
         "age": None,
         "chronic_conditions": [],
         "allergies": [],
-        "other_symptoms": [],
     }
 
     # 6 assistant messages = max rounds
@@ -161,7 +156,6 @@ async def test_consult_merges_slots_without_data_loss():
         "age": None,
         "chronic_conditions": [],
         "allergies": [],
-        "other_symptoms": [],
     }
 
     messages = [{"role": "user", "content": "我发烧了"}]

@@ -100,7 +100,6 @@ async def test_topic_switch_preserves_context():
         "age": 25,
         "chronic_conditions": [],
         "allergies": [],
-        "other_symptoms": [],
     }
 
     # The dispatcher node should set previous_phase to "consulting"

@@ -60,16 +60,11 @@ class SymptomKeywordMatch(BaseEvidence):
                 merge_strategy="max",
             )
 
-        # ── 在适应症文本中搜索 ──
+        # ── 在适应症文本中搜索（所有症状已统一在 symptoms 列表中）──
         indication = (drug.indication_summary or "").lower()
-        other_symptoms = slots.get("other_symptoms", [])
-        all_symptoms = symptom_names + [
-            s.get("name", s) if isinstance(s, dict) else str(s)
-            for s in other_symptoms
-        ]
 
         matched = []
-        for kw in all_symptoms:
+        for kw in symptom_names:
             kw_lower = kw.lower()
             if kw_lower in indication:
                 # 精确匹配：整个关键词出现在适应症文本中
@@ -82,7 +77,7 @@ class SymptomKeywordMatch(BaseEvidence):
         if matched:
             # 统计精确匹配占比
             exact_matches = [m for m in matched if "(部分)" not in m]
-            if len(exact_matches) >= len(all_symptoms) * 0.5:
+            if len(exact_matches) >= len(symptom_names) * 0.5:
                 value = 1.0   # ≥50% 精确匹配 → 高度匹配
             elif exact_matches:
                 value = 0.7   # 有精确匹配但不够多 → 中等匹配

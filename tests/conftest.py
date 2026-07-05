@@ -26,7 +26,6 @@ def empty_slots() -> dict:
         "age": None,
         "chronic_conditions": [],
         "allergies": [],
-        "other_symptoms": [],
     }
 
 
@@ -74,8 +73,11 @@ def emergency_slots(empty_slots) -> dict:
     """Emergency signs — should trigger R4."""
     return {
         **empty_slots,
-        "symptoms": [{"name": "头痛", "severity": "剧烈"}],
-        "other_symptoms": ["呼吸困难", "胸痛"],
+        "symptoms": [
+            {"name": "头痛", "severity": "剧烈"},
+            {"name": "呼吸困难"},
+            {"name": "胸痛"},
+        ],
         "temperature": 38.0,
         "duration_days": 1,
         "age": 45,

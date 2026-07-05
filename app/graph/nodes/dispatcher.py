@@ -88,6 +88,7 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
 
     # ── 3. 调用 LLM 获取路由决策 ──
     try:
+        #todo 用户在描述症状，却路由到推荐了
         decision = await llm_client.generate_structured(
             messages=prompt_messages,
             schema=DispatcherDecision,

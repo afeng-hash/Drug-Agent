@@ -53,7 +53,6 @@ async def consult_node(
             "age": None,
             "chronic_conditions": [],
             "allergies": [],
-            "other_symptoms": [],
         }
         consult_rounds = 0  # 新症状 → 轮数从头算
 

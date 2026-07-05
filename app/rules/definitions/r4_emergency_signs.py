@@ -13,13 +13,26 @@ class R4_EmergencySigns(SafetyRule):
     description = "出现呼吸困难、胸痛、意识模糊等急症信号 → 阻断推荐"
 
     def evaluate(self, slots: dict) -> RuleResult:
-        other_symptoms = slots.get("other_symptoms", [])
-        if not other_symptoms:
+        symptoms = slots.get("symptoms", [])
+        if not symptoms:
             return RuleResult()
 
-        other_text = " ".join(other_symptoms).lower()
+        # 从统一 symptoms 列表中提取纯文本名称
+        symptom_names: list[str] = []
+        for s in symptoms:
+            if isinstance(s, dict):
+                name = s.get("name", "")
+                if name:
+                    symptom_names.append(name)
+            elif isinstance(s, str):
+                symptom_names.append(s)
+
+        if not symptom_names:
+            return RuleResult()
+
+        symptom_text = " ".join(symptom_names).lower()
         for keyword in EMERGENCY_KEYWORDS:
-            if keyword in other_text:
+            if keyword in symptom_text:
                 return RuleResult(
                     triggered=True,
                     action="BLOCK",

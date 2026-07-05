@@ -22,7 +22,6 @@ async def test_safety_block_stops_recommendation():
         "special_population": None,
         "chronic_conditions": [],
         "allergies": [],
-        "other_symptoms": [],
     }
 
     result = engine.check(slots)
@@ -49,7 +48,7 @@ async def test_safety_block_message_contains_guidance():
         "special_population": None,
         "chronic_conditions": [],
         "allergies": [],
-        "other_symptoms": ["呼吸困难"],
+        "symptoms": [{"name": "头痛", "severity": "剧烈"}, {"name": "呼吸困难"}],
     }
 
     result = engine.check(slots)

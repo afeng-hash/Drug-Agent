@@ -73,7 +73,6 @@ class SafetyRule(ABC):
               - age (int|None)                ← 年龄
               - chronic_conditions (list[str])← 慢性病史
               - allergies (list[str])         ← 过敏史
-              - other_symptoms (list[str])    ← 伴随症状
 
         Returns:
             RuleResult：是否触发、采取什么行动、理由、排除哪些药品

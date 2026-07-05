@@ -145,8 +145,10 @@ class ConversationState(TypedDict):
         "age": 28,                             # ← 年龄，int，可为 null
         "chronic_conditions": ["胃溃疡"],        # ← 慢性病史（影响用药安全性）
         "allergies": ["阿司匹林"],              # ← 药物过敏史
-        "other_symptoms": ["流鼻涕", "咳嗽"],   # ← 其他伴随症状
       }
+
+    所有症状统一放入 symptoms 列表，不区分「主诉」和「伴随」。
+    每个症状 dict 可包含：name（必填）、location、severity、onset。
 
     安全规则"信息充分"标准（三个必填维度）：
       1️⃣ symptoms（主要症状）— 至少知道症状名称
@@ -392,7 +394,6 @@ def initial_state(
             "age": None,
             "chronic_conditions": [],
             "allergies": [],
-            "other_symptoms": [],
         },
         dispatcher_result={},
         consult_next_action="ask",
