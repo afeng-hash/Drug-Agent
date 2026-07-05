@@ -9,6 +9,8 @@ ReAct-style consult agent — LLM 驱动的动态症状收集。
   - Consult Agent 负责"问什么"（症状收集）
 """
 
+import json
+
 from pydantic import BaseModel, Field
 
 from app.agent.prompts import CONSULT_PROMPT
@@ -40,6 +42,9 @@ async def run_consult(
     current_slots: dict,
     max_rounds: int = 6,
     consult_rounds: int = 0,
+    dispatcher_intent: str = "",
+    dispatcher_params: dict | None = None,
+    last_question: str = "",
 ) -> ConsultResult:
     """执行一轮症状问诊。
 
@@ -51,11 +56,14 @@ async def run_consult(
       4. 如果已达最大轮数，强制 done
 
     Args:
-        llm_client:     LLM 客户端
-        messages:       完整对话历史（[{"role": "user"|"assistant", "content": "..."}]）
-        current_slots:  当前已收集的症状槽位
-        max_rounds:     最大追问轮数。超过此数不管是否充分都强制 done
-        consult_rounds: 当前已追问轮数（由 consult_node 从 state 中传入并递增）
+        llm_client:         LLM 客户端
+        messages:           完整对话历史（[{"role": "user"|"assistant", "content": "..."}]）
+        current_slots:      当前已收集的症状槽位
+        max_rounds:         最大追问轮数。超过此数不管是否充分都强制 done
+        consult_rounds:     当前已追问轮数（由 consult_node 从 state 中传入并递增）
+        dispatcher_intent:  Dispatcher 判定的用户意图（如 want_recommend / switch_drug）
+        dispatcher_params:  Dispatcher 附加参数（如 filter_cheaper 等）
+        last_question:      系统上一轮向用户提的问题（帮助理解用户当前在回答什么）
 
     Returns:
         ConsultResult：更新后的槽位、回复文本、下一步动作、症状摘要
@@ -86,15 +94,37 @@ async def run_consult(
     # ── 构建 LLM 调用消息 ──
     system_msg = {"role": "system", "content": CONSULT_PROMPT}
 
+    # 构建结构化的上下文信息
+    context_parts = []
+
+    # 1. 已收集的症状槽位（JSON 格式，便于 LLM 解析）
+    context_parts.append("## 当前已收集的症状信息 (slots)")
+    context_parts.append("```json")
+    context_parts.append(json.dumps(current_slots, ensure_ascii=False, indent=2))
+    context_parts.append("```")
+
+    # 2. 进度信息
+    context_parts.append(f"## 进度")
+    context_parts.append(f"- 已追问轮数: {consult_rounds}/{max_rounds}")
+    if consult_rounds >= max_rounds:
+        context_parts.append(f"⚠️ 已达到最大追问轮数，请务必判定为 done。")
+
+    # 3. 上游路由意图（帮助判断场景：推荐意愿/换药/普通追问）
+    if dispatcher_intent:
+        context_parts.append(f"## 上游路由意图")
+        context_parts.append(f"dispatcher_intent = \"{dispatcher_intent}\"")
+        if dispatcher_params:
+            context_parts.append(f"dispatcher_params = {json.dumps(dispatcher_params, ensure_ascii=False)}")
+
+    # 4. 上一轮系统提问（关键：帮助 LLM 理解用户当前在回答什么）
+    if last_question:
+        context_parts.append(f"## 上一轮系统提问")
+        context_parts.append(f"系统刚才问了: \"{last_question}\"")
+        context_parts.append(f"（用户当前消息是对这个问题的回答，请据此理解用户意图）")
+
     context_msg = {
         "role": "system",
-        "content": (
-            f"## 当前已收集的症状信息 (slots)\n"
-            f"```json\n{current_slots}\n```\n"
-            f"## 已追问轮数: {consult_rounds}/{max_rounds}\n"
-            + (f"⚠️ 已达到最大追问轮数，请务必判定为 done。"
-               if consult_rounds >= max_rounds else "")
-        ),
+        "content": "\n".join(context_parts),
     }
 
     # 取最近 10 条消息作为上下文（太长会超过 token 限制）

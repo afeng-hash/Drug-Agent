@@ -17,11 +17,12 @@ def route_after_dispatcher(state: ConversationState) -> str:
     读取 dispatcher_result.route，映射到实际节点名。
     如果 LLM 返回了无效路由（不应该发生，但兜底），默认走 consult。
 
-    可达目标：consult / explain / recommend / end
+    可达目标：consult / explain / end
+    （recommend 路由已移除——推荐永远是 consult→done 的自然结果）
     """
     route = state.get("dispatcher_result", {}).get("route", "consult")
-    # 白名单校验：只允许这 4 个有效路由
-    valid_routes = {"consult", "explain", "recommend", "end"}
+    # 白名单校验：只允许这 3 个有效路由
+    valid_routes = {"consult", "explain", "end"}
     return route if route in valid_routes else "consult"
 
 

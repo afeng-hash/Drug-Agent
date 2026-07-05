@@ -11,8 +11,27 @@ Consult node — ReAct 症状问诊。
 """
 
 from app.agent.consult_agent import run_consult
-from app.graph.state import ConversationState
+from app.graph.state import ConversationState, normalize_messages
 from app.llm.client import LLMClient
+
+
+def _extract_last_assistant_question(messages: list) -> str:
+    """从对话历史中提取系统最近一次提问的内容。
+
+    帮助 LLM 理解"用户当前在回答什么"，尤其在否定回答（"没有"）
+    和简短回答（"38度"）场景下至关重要。
+
+    Args:
+        messages: 对话历史列表（混合 dict / LangChain 对象）
+
+    Returns:
+        最近一条 assistant 消息内容，或空字符串
+    """
+    normalized = normalize_messages(messages)
+    for m in reversed(normalized):
+        if m.get("role") == "assistant":
+            return m.get("content", "").strip()
+    return ""
 
 
 async def consult_node(
@@ -38,7 +57,9 @@ async def consult_node(
     """
     messages = state.get("messages", [])
     slots = state.get("consult_slots", {})
-    dispatcher_params = state.get("dispatcher_result", {}).get("params", {})
+    dispatcher_result = state.get("dispatcher_result", {})
+    dispatcher_params = dispatcher_result.get("params", {})
+    dispatcher_intent = dispatcher_result.get("intent", "")
     consult_rounds = state.get("consult_rounds", 0)
 
     # 如果 Dispatcher 标记了 reset_slots（用户切换了症状描述），清空旧槽位
@@ -56,6 +77,9 @@ async def consult_node(
         }
         consult_rounds = 0  # 新症状 → 轮数从头算
 
+    # 提取上一轮系统提问（帮助 LLM 理解用户当前在回答什么）
+    last_question = _extract_last_assistant_question(messages)
+
     # 委托给 Consult Agent（核心逻辑在 app/agent/consult_agent.py）
     result = await run_consult(
         llm_client=llm_client,
@@ -63,6 +87,9 @@ async def consult_node(
         current_slots=slots,
         max_rounds=max_rounds,
         consult_rounds=consult_rounds,
+        dispatcher_intent=dispatcher_intent,
+        dispatcher_params=dispatcher_params,
+        last_question=last_question,
     )
 
     return {

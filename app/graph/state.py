@@ -101,17 +101,20 @@ class ConversationState(TypedDict):
     dispatcher_result: dict[str, Any]
     """【Dispatcher 输出】LLM 分析用户意图后返回的路由决策。
 
+    Dispatcher 只负责对话方向分类，不判断信息充分性。
+    "recommend" 路由已移除——推荐永远是 consult→done 的自然结果。
+
     结构：
       {
-        "route": "consult" | "explain" | "recommend" | "end",
+        "route": "consult" | "explain" | "end",
           # 目标节点：
-          #   consult   → 症状追问
-          #   explain   → 药品解释
-          #   recommend → 直接推荐（如有完整信息或用户换药）
+          #   consult   → 症状相关（描述症状/回答追问/个人信息/推荐意愿/换药）
+          #   explain   → 药品解释（询问某个具体药品）
           #   end       → 结束（闲聊/感谢/放弃）
-        "intent": "describe_symptom" | "ask_drug" | "switch_drug" |
-                  "switch_symptom" | "give_up" | "other",
-          # 细分的用户意图，影响节点的处理策略
+        "intent": "describe_symptom" | "answer_question" | "provide_profile" |
+                  "want_recommend" | "switch_drug" | "switch_symptom" |
+                  "ask_drug" | "give_up" | "other",
+          # 细分的用户意图，传递给 Consult Agent 影响追问策略
         "params": {
           "drug_name": "布洛芬",              # ← intent=ask_drug 时，提取的药品名
           "reset_slots": true,                # ← intent=switch_symptom 时，清空旧症状
@@ -120,7 +123,7 @@ class ConversationState(TypedDict):
       }
 
     来源：Dispatcher 节点（LLM 调用）
-    消费：router.py 的 route_after_dispatcher()，以及 consult/explain/recommend 节点
+    消费：router.py 的 route_after_dispatcher()，以及 consult/explain 节点
     """
 
     # ────────────────────────────────────────────

@@ -1,218 +1,187 @@
-# PR Summary：统一症状数据结构 — 废弃 `other_symptoms`，所有症状平等对待
+# PR Summary：Dispatch 职责边界重构 — 收窄 Dispatcher，强化 Consult Agent
 
 **Branch**: `master`  
-**Files**: 16 modified | **Diff**: `+75 / -55`
+**Files**: 7 modified | **Diff**: `+239 / -83`
 
 ---
 
 ## 一、问题背景
 
-旧设计中，症状被分为两个字段存储：
+旧架构中，Dispatcher 同时承担两个职责：
 
-```python
-consult_slots = {
-    "symptoms":       [{"name": "头痛", "severity": "中度"}],  # 主诉症状
-    "other_symptoms": ["流鼻涕", "咳嗽"],                      # 伴随症状
-}
-```
+1. **对话方向分类**（consult / explain / recommend / end）——合理
+2. **隐式判断信息充分性**——越界了
 
-这带来了几个问题：
+这导致两个问题：
 
-1. **LLM 决策负担**：Consult Agent 需要在「主诉」和「伴随」之间做语义区分，LLM 经常犹豫不决，导致症状被放入错误字段
-2. **下游处理复杂**：Recommend 节点需要拼接两处来源（1.0 权重 + 0.5 权重），Scoring 证据规则需要分别遍历两处，Safety 规则只检查 `other_symptoms` 而遗漏 `symptoms` 中的急症关键词
-3. **字段语义模糊**："头痛"和"流鼻涕"对用户来说都是不舒服的症状，强行区分主/次没有药学依据——症状应该按「是否匹配药品适应症」来评价，而非按「用户先说的还是后说的」
+**问题 A — Dispatcher 越权推荐**：
+用户说"推荐吧"，Dispatcher 直接 route="recommend" 跳过 consult。此时如果用户消息中还夹杂了"我12岁"这样的信息，年龄就被丢掉了——因为 Dispatcher 不提取症状，只是做路由决策。
+
+**问题 B — Consult Agent 信息不全**：
+Consult Agent 不知道上游 Dispatcher 的意图判断（用户是"想推荐了"还是"想换药"），无法针对性调整追问策略。同时也不知道系统上一轮问了什么，面对用户的简短回答（"没有""38度"）缺乏上下文。
 
 ## 二、解决方案
 
-**所有症状统一放入 `symptoms` 列表，废弃 `other_symptoms` 字段。**
+**一句话**：Dispatcher 只做对话方向分类（3 路），推荐永远是 consult→done 的自然结果；Consult Agent 成为推荐流程的唯一守门人。
 
-```python
-# 新设计
-consult_slots = {
-    "symptoms": [
-        {"name": "头痛", "severity": "中度", "onset": "2天前"},
-        {"name": "流鼻涕", "onset": "有点"},
-        {"name": "咳嗽"},
-    ],
-}
-# other_symptoms 字段已删除
+```
+旧架构：
+  Dispatcher ──recommend──▶ SafetyBlock ──▶ Recommend
+       │                         ↑
+       └──consult──▶ Consult      │  （Dispatcher 可以绕过 Consult 直接推荐）
+                                     信息提取不完整
+
+新架构：
+  Dispatcher ──consult──▶ Consult ──done──▶ SafetyBlock ──▶ Recommend
+       │                     ↑
+       └──explain            │  （推荐只有一条路径：Consult 判定 done）
+       └──end                │  Consult 收到 intent 上下文，可针对性追问
 ```
 
 ### 变更范围
 
-本次改动横跨 **4 层架构**，确保端到端一致性：
-
 ```
-Prompt (LLM 指令)
-  → Consult Node (初始化)
-    → State (数据结构)
-      → Recommend Node (提取+去重)
-      → Safety Rules (急症/过敏检测)
-      → Evidence Rules (症状关键词匹配)
+Dispatcher (职责收窄)
+  → Router (3 路分支)
+    → Consult Node (上下文增强)
+      → Consult Agent (Prompt 大幅强化)
+        → State (注释更新)
 ```
 
 ---
 
-## 二、逐文件变更
+## 三、逐文件变更
 
-### 1. Prompt 层 — 从源头消除歧义
+### 1. `app/agent/prompts.py` (+114/-27) — 核心重构
 
-**`app/agent/prompts.py`** (+12/-5)
+**Dispatcher Prompt 重写**：从"调度器"改名为"对话方向识别器"，核心定位从"决定系统下一步做什么"改为"判断用户当前在说什么"。
 
-```diff
-+## 症状归类规则（重要）
-+- 用户提到的所有症状统一放入 `symptoms` 列表，不要区分「主诉」和「伴随」
-+- 每个症状的 `onset` 字段记录用户的自然语言描述
-+- 不要在 symptoms 和 other_symptoms 之间犹豫——全部进 symptoms
-+
-+**禁止使用 other_symptoms 字段**——所有症状放入 symptoms 列表
-```
+关键变化：
+- 新增"核心约束"声明：不判断信息是否充分、不决定是否可以推荐
+- 路由从 4 类简化为 3 类（移除 recommend），按优先级组织
+- 意图分类从 6 种扩展到 9 种：新增 `answer_question`、`provide_profile`、`want_recommend`
+- 新增 7 条决策规则（信息充分性不是你的事、简短应答不是结束、混合意图看主次等）
+- 新增反模式列表（不要因为"推荐"就 route="recommend"、不要根据 slots 判断够了等）
+- "换药也是 consult"——之前 switch_drug 会路由到 recommend，现在走 consult
 
-LLM 输出示例也从 `"other_symptoms": ["流鼻涕"]` 改为在 `symptoms` 中包含多个条目。
+**Consult Prompt 重写**：从 ~30 行扩展到 ~120 行。
 
-### 2. State 层 — 数据结构统一
+关键变化：
+- **两级信息充分标准**：第一级（必须）—至少 1 个症状；第二级（尽力获取）—持续时间/年龄/过敏/慢性病
+- **追问策略**：一次只问 1 个，优先问未获取维度，已问过的别重复
+- **4 种特殊场景处理**：
+  - 用户表达推荐意愿（`want_recommend`）：提取信息→判断→不够追问 1 个关键问题
+  - 用户要求换药（`switch_drug`）：有症状→直接 done；没有→正常问诊
+  - 用户回答否定：关联上一轮提问的维度，记录否认
+  - 用户不耐烦：只要第一级满足→done
+- **槽位定义**：JSON 格式说明每个字段的含义和 null 的语义
+- **症状提取规则**：明确否定也要记录、onset 保留用户原话
 
-**`app/graph/state.py`** (+4/-2)
+### 2. `app/agent/consult_agent.py` (+49/-13)
 
-- 删除 `other_symptoms` 字段定义和文档注释
-- 新增说明："所有症状统一放入 symptoms 列表，不区分「主诉」和「伴随」"
-- `initial_state()` 移除 `"other_symptoms": []`
-
-**`app/graph/nodes/consult.py`** (+1/-1)
-
-- 删除空槽位初始化中的 `"other_symptoms": []`
-
-### 3. Recommend 节点 — 简化症状提取
-
-**`app/graph/nodes/recommend.py`** (+22/-11)
-
-```diff
-- # 主诉症状 weight=1.0，附加症状 weight=0.5
-- primary_names = _extract_symptom_names(symptoms)
-- secondary_names = _extract_symptom_names(slots.get("other_symptoms", []))
-- symptom_weights = (
--     [{"name": n, "weight": 1.0} for n in primary_names]
--     + [{"name": n, "weight": 0.5} for n in secondary_names]
-- )
-
-+ # 所有症状等权，不区分主诉/伴随
-+ symptom_names_raw = _extract_symptom_names(symptoms)
-+ symptom_weights = [{"name": n, "weight": 1.0} for n in symptom_names_raw]
-```
-
-同时新增 **步骤 1.6 — 去重**：标准化后同一标准症状名只保留一次，避免 KG 重复查询。
-
-### 4. Safety Rule 层 — 统一症状来源
-
-**`app/rules/base.py`** (-1)
-
-- 删除 docstring 中的 `other_symptoms` 字段说明
-
-**`app/rules/definitions/r4_emergency_signs.py`** (+13/-4)  
-**`app/rules/definitions/r5_severe_allergy.py`** (+13/-4)
-
-两者做了相同的重构：从读取 `other_symptoms`（纯字符串列表）改为读取统一的 `symptoms`（dict 列表），并兼容 str 格式：
+**新增 3 个参数**：
 
 ```python
-# 旧：只检查 other_symptoms（纯字符串列表）
-other_symptoms = slots.get("other_symptoms", [])
-other_text = " ".join(other_symptoms).lower()
-
-# 新：检查统一 symptoms（dict 列表，也兼容 str 格式）
-symptoms = slots.get("symptoms", [])
-symptom_names = []
-for s in symptoms:
-    if isinstance(s, dict):
-        name = s.get("name", "")
-        if name:
-            symptom_names.append(name)
-    elif isinstance(s, str):
-        symptom_names.append(s)
-symptom_text = " ".join(symptom_names).lower()
+async def run_consult(
+    ...,
+    dispatcher_intent: str = "",       # 新增
+    dispatcher_params: dict | None = None,  # 新增
+    last_question: str = "",           # 新增
+)
 ```
 
-**影响**：之前 R4/R5 只检测 `other_symptoms` 中的急症关键词，如果用户把"呼吸困难"说成主诉症状（放入 `symptoms`），反而不触发拦截。现在统一检测所有症状，**急症拦截覆盖率提升**。
-
-### 5. Evidence Rule 层 — 简化匹配逻辑
-
-**`app/scorer/evidence/base.py`** (-1)
-
-- 删除 docstring 中的 `other_symptoms` 字段说明
-
-**`app/scorer/evidence/symptom_keyword.py`** (+2/-8)
-
-```diff
-- # 分别在 symptoms 和 other_symptoms 中搜索
-- other_symptoms = slots.get("other_symptoms", [])
-- all_symptoms = symptom_names + [
--     s.get("name", s) if isinstance(s, dict) else str(s)
--     for s in other_symptoms
-- ]
-
-+ # 所有症状已统一在 symptoms 列表中
-```
-
-简化了两个来源拼接的代码，症状关键词匹配逻辑更清晰。
-
-### 6. 测试层 — 全面适配
-
-| 文件 | 变更 | 说明 |
-|------|------|------|
-| `tests/conftest.py` | +3/-2 | `emergency_slots` 急症症状改为 dict 格式放入 `symptoms`；`empty_slots` 删除 `other_symptoms` |
-| `tests/integration/test_chat_flow.py` | -1 | 删除 `other_symptoms` |
-| `tests/integration/test_safety_flow.py` | +1/-2 | R4 测试改用 `symptoms` + dict 格式 |
-| `tests/unit/test_consult_agent.py` | -7 | 5 处删除 `other_symptoms` |
-| `tests/unit/test_dispatcher.py` | -2 | 2 处删除 `other_symptoms` |
-| `tests/unit/test_rules_engine.py` | +6/-5 | R4/R5 测试改为 `symptoms` + dict 格式 |
-| `tests/unit/test_dispatcher.py` | -2 | 删除 `other_symptoms` |
-
-### 7. 其他
-
-**`app/graph/nodes/dispatcher.py`** (+1)
-
-- 添加 TODO 注释标记已知问题
-
----
-
-## 三、Breaking Changes
-
-### BC-1：`consult_slots` 数据结构变更
+**上下文消息重构**：从简单字符串拼接改为结构化 markdown（4 个 section）：
 
 ```python
 # 旧
-{"symptoms": [...], "other_symptoms": [...]}
+context_msg = {"role": "system", "content": f"## slots\n{current_slots}\n## 轮数\n{rounds}"}
 
-# 新
-{"symptoms": [...]}  # other_symptoms 已删除
+# 新 — 结构化
+context_parts = [
+    "## 当前已收集的症状信息 (slots)", "```json", json.dumps(slots), "```",
+    "## 进度", f"- 已追问轮数: {rounds}/{max}",
+    "## 上游路由意图", f"dispatcher_intent = \"{intent}\"",
+    "## 上一轮系统提问", f"系统刚才问了: \"{question}\"",
+]
 ```
 
-**影响范围**：
+### 3. `app/graph/nodes/consult.py` (+27/-2)
 
-| 影响方 | 处理方式 |
-|--------|---------|
-| LLM Prompt | ✅ 已更新——要求所有症状进 `symptoms`，禁止使用 `other_symptoms` |
-| Safety Rules (R4, R5) | ✅ 已更新——从 `symptoms` 读取，兼容 dict/str 格式 |
-| Evidence Rules | ✅ 已更新——删除 `other_symptoms` 拼接逻辑 |
-| Recommend Node | ✅ 已更新——所有症状等权 |
-| State / Consult Node | ✅ 已更新——删除字段定义和初始化 |
-| **数据库 `state_snapshot`** | ⚠️ 旧会话的 snapshot 可能包含 `other_symptoms` 字段，下游代码已兼容（`slots.get("other_symptoms", [])`→`[]`），不影响运行 |
-| **前端** | ⚠️ 如果前端直接读取 `consult_slots.other_symptoms` 展示症状列表，需改为读取 `consult_slots.symptoms` |
+**新增 `_extract_last_assistant_question()`** — 从对话历史提取系统最近一次提问，帮助 LLM 理解"用户当前在回答什么"。
 
-### BC-2：安全规则检查范围变化（业务行为变更）
+**新增 3 个参数传递**：从 state 提取 `dispatcher_intent` 和 `last_question`，传递给 `run_consult()`。
 
-R4（急症信号）和 R5（严重过敏）**之前只检查 `other_symptoms`**，现在检查所有 `symptoms`。这可能导致之前未被拦截的会话现在触发 BLOCK——但这是**正确的行为修正**，急症信号本就不应该被遗漏。
+### 4. `app/graph/nodes/dispatcher.py` (+8/-2)
+
+- `DispatcherDecision` schema 更新：route 移除 recommend，intent 新增 3 种
+- 移除 `#todo` 注释（问题已通过架构重构解决）
+- 降级路由注释更新
+
+### 5. `app/graph/builder.py` (+3/-8)
+
+- Graph 图注释更新：recommend 不再是 dispatcher 的直接分支
+- 条件边从 4 路缩减为 3 路（移除 `"recommend": "safety_block"`）
+
+### 6. `app/graph/router.py` (+2/-4)
+
+- 白名单从 `{"consult", "explain", "recommend", "end"}` 缩减为 `{"consult", "explain", "end"}`
+- 注释更新
+
+### 7. `app/graph/state.py` (+8/-8)
+
+- `dispatcher_result` 字段注释更新：意图从 6 种扩展为 9 种，消费方从 `consult/explain/recommend` 改为 `consult/explain`
+- 明确标注：Dispatcher 不判断信息充分性，recommend 路由已移除
 
 ---
 
-## 四、业务影响
+## 四、Breaking Changes
+
+### BC-1：Dispatcher 路由从 4 路缩减为 3 路（业务行为变更）
+
+```python
+# 旧：4 路
+{"consult", "explain", "recommend", "end"}
+
+# 新：3 路
+{"consult", "explain", "end"}
+```
+
+**影响**：
+
+| 场景 | 旧行为 | 新行为 | 影响 |
+|------|--------|--------|------|
+| 用户说"推荐吧" | Dispatcher → recommend → 直接推荐 | Dispatcher → consult → Consult 判定 done → 推荐 | 多走一轮 consult，但信息提取更完整 |
+| 用户说"有没有便宜的" | Dispatcher → recommend（带 filter_cheaper） | Dispatcher → consult → Consult 判定 done → 推荐 | 换药参数仍通过 intent=switch_drug 传递 |
+| 用户在 consulting 阶段说"推荐吧"且附带"我12岁" | 年龄信息丢失（Dispatcher 不提取） | Consult 提取年龄后再 done | **信息不丢失** |
+
+**核心原则**：推荐永远是 consult→done 的自然结果，Dispatcher 没有直达推荐的权利。这确保了信息提取的完整性。
+
+### BC-2：`run_consult()` 新增 3 个可选参数（向后兼容）
+
+```python
+async def run_consult(
+    ...,
+    dispatcher_intent: str = "",          # 新增，默认空
+    dispatcher_params: dict | None = None, # 新增，默认 None
+    last_question: str = "",              # 新增，默认空
+)
+```
+
+默认值保证向后兼容。但如果外部有直接调用 `run_consult()` 的代码（测试除外），建议传入新参数以获得更好的上下文感知。
+
+---
+
+## 五、业务影响
 
 | 维度 | 影响 |
 |------|------|
-| **推荐准确度** | 所有症状等权参与评分，不再因"伴随症状"被 0.5 折权而遗漏匹配 |
-| **急症拦截覆盖率** | R4/R5 从只检查 `other_symptoms` 扩展到所有症状，不再遗漏主诉中的急症信号 |
-| **LLM 调用质量** | Consult Agent 不再纠结"主诉 vs 伴随"的语义区分，症状收集更稳定 |
-| **代码简洁度** | 删除 55 行分散在两处的症状拼接/遍历代码 |
-| **数据模型清晰度** | 单一症状来源，不再有"这个症状该放哪里"的歧义 |
+| **信息提取完整度** | 用户说"推荐吧"时附带的信息（年龄、过敏等）不再丢失，Consult 会先提取再 done |
+| **追问精准度** | Consult Agent 知道上游意图（want_recommend vs switch_drug vs normal），可针对性调整策略 |
+| **上下文感知** | 知道上一轮问了什么，面对"没有""38度"等简短回答时不再困惑 |
+| **职责边界清晰** | Dispatcher 只管分类，Consult 管提取+判定，各司其职，不会互相越界 |
+| **Prompt 可维护性** | 结构化 markdown 上下文替代字符串拼接，后续扩展更方便 |
+| **系统安全性** | 推荐只有一条路径（consult→done），不会因 Dispatcher 判断失误跳过信息收集 |
 
 ---
+
 

@@ -9,8 +9,9 @@ Graph builder — 组装 LangGraph 状态机。
                  │    │  (ask)→ end        (BLOCK)→ end
                  │    │
                  │    ├── explain ──▶ end
-                 │    ├── recommend ──▶ safety_block  ← dispatcher直接推荐也先过安全拦截
                  │    └── end
+
+关键设计：recommend 永远是 consult→done 的自然结果，dispatcher 不能直达 recommend。
 """
 
 from functools import partial
@@ -127,14 +128,14 @@ def build_graph(
     # intake → dispatcher（无条件）
     graph.add_edge("intake", "dispatcher")
 
-    # dispatcher → 4 路条件分支
+    # dispatcher → 3 路条件分支
+    # （recommend 路由已移除——推荐永远是 consult→done 的自然结果）
     graph.add_conditional_edges(
         "dispatcher",
         route_after_dispatcher,           # 条件函数：读 dispatcher_result.route
         {
-            "consult": "consult",          # 症状问诊
-            "explain": "explain",          # 药品解释
-            "recommend": "safety_block",   # 直接推荐 → 先过安全拦截
+            "consult": "consult",          # 症状相关（描述、回答、个人信息、推荐意愿、换药）
+            "explain": "explain",          # 药品咨询
             "end": "end",                  # 结束
         },
     )

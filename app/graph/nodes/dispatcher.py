@@ -20,13 +20,17 @@ class DispatcherDecision(BaseModel):
     """LLM 输出的路由决策结构。
 
     通过 generate_structured() 让 LLM 严格输出 JSON，解析为此模型。
+
+    Dispatcher 只负责对话方向分类，不判断信息充分性。
+    "recommend" 路由已移除——推荐永远是 consult→done 的自然结果。
     """
 
     route: str = Field(
-        description="目标节点: consult(症状问诊) | explain(药品解释) | recommend(直接推荐) | end(结束)"
+        description="目标节点: consult(症状相关) | explain(药品咨询) | end(结束)"
     )
     intent: str = Field(
-        description="细分的用户意图: describe_symptom | ask_drug | switch_drug | switch_symptom | give_up | other"
+        description="用户意图: describe_symptom | answer_question | provide_profile | "
+                    "want_recommend | switch_drug | switch_symptom | ask_drug | give_up | other"
     )
     params: dict = Field(
         default_factory=dict,
@@ -36,6 +40,10 @@ class DispatcherDecision(BaseModel):
 
 async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> dict:
     """分析对话上下文 + 用户最新消息，决策路由和意图。
+
+    Dispatcher 只负责对话方向分类（consult / explain / end），
+    不判断信息是否充分、不决定是否可以推荐。
+    推荐永远是 consult→done 的自然结果。
 
     处理流程：
       1. 从 state.messages 中提取最新一条用户消息
@@ -88,7 +96,6 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
 
     # ── 3. 调用 LLM 获取路由决策 ──
     try:
-        #todo 用户在描述症状，却路由到推荐了
         decision = await llm_client.generate_structured(
             messages=prompt_messages,
             schema=DispatcherDecision,
@@ -129,7 +136,7 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
 def _fallback_route() -> dict:
     """LLM 失败或无法判断时的默认路由 → consult。
 
-    安全策略：不确定时宁可多问几句，不要乱推荐。
+    安全策略：不确定时宁可多走一轮 consult 提取信息，不要直接推荐。
     """
     return {
         "dispatcher_result": {
