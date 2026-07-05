@@ -15,7 +15,13 @@ import pytest
 
 from app.db.models import WeightConfig
 from app.db.repositories.weight_config import WeightConfigRepository
-from app.scorer.engine import score_all, score_one, _normalize_weights
+from app.scorer.engine import (
+    _normalize_weights,
+    normalize_for_display,
+    score_all,
+    score_one,
+    score_one_v2,
+)
 from app.scorer.evidence_engine import EvidenceEngine, DEFAULT_FEATURES
 from app.scorer.evidence import (
     AgeSuitability,
@@ -448,3 +454,258 @@ class TestNormalizeWeightsDiag:
         weights = {"a": 0.0, "b": 0.0}
         result = _normalize_weights(weights)
         assert result == weights
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test 5: v2 Scoring Engine — hierarchical multiplicative model
+# ═══════════════════════════════════════════════════════════════
+
+class TestScoringEngineV2Diag:
+    """Manual verification of the v2 hierarchical multiplicative formula."""
+
+    def test_v2_specialist_drug_score(self):
+        """Single symptom, specialist drug: manual calculation verification.
+
+        formula: sm × focus^α × age^β × otc^γ
+        右美沙芬: 0.57 × 0.25^0.5 × 1.0^0.3 × 0.7^0.05
+                = 0.57 × 0.50 × 1.0 × 0.982 = 0.280
+        """
+        features = {
+            "symptom_match": 0.57,
+            "symptom_focus_ratio": 0.25,  # 1/4, specialist
+            "age_suitability": 1.0,
+            "otc_safety_level": 0.7,
+        }
+        exponents = {"focus": 0.5, "age": 0.3, "otc": 0.05}
+
+        result = score_one_v2(features, exponents, 1, "右美沙芬")
+
+        print(f"\n=== V2 Specialist Score: {result.total_score} ===")
+        for dim in result.dimensions:
+            print(f"  [{dim.feature_name}] exponent={dim.weight:.2f}, fv={dim.feature_value:.3f}, factor={dim.contribution}")
+
+        # Manual: 0.57 * 0.5 * 1.0 * 0.982 = 0.280
+        expected_sm = 0.57
+        expected_focus_factor = 0.25 ** 0.5  # 0.5
+        expected_age_factor = 1.0 ** 0.3  # 1.0
+        expected_otc_factor = 0.7 ** 0.05  # ≈ 0.9823
+        expected = round(expected_sm * expected_focus_factor * expected_age_factor * expected_otc_factor, 4)
+
+        assert result.total_score == pytest.approx(expected)
+        assert 0.25 < result.total_score < 0.35
+        assert not result.excluded
+
+    def test_v2_broad_spectrum_drug_score(self):
+        """Single symptom, broad drug: should score significantly lower than specialist.
+
+        formula: 酚麻美敏: 0.35 × 0.14^0.5 × 1.0^0.3 × 0.7^0.05
+                = 0.35 × 0.374 × 1.0 × 0.982 = 0.129
+        """
+        features = {
+            "symptom_match": 0.35,
+            "symptom_focus_ratio": 0.14,  # 1/7, broad spectrum
+            "age_suitability": 1.0,
+            "otc_safety_level": 0.7,
+        }
+        exponents = {"focus": 0.5, "age": 0.3, "otc": 0.05}
+
+        result = score_one_v2(features, exponents, 2, "酚麻美敏")
+
+        print(f"\n=== V2 Broad Drug Score: {result.total_score} ===")
+
+        expected_sm = 0.35
+        expected_focus_factor = 0.14 ** 0.5  # ≈ 0.374
+        expected = round(expected_sm * expected_focus_factor * 1.0 * (0.7 ** 0.05), 4)
+
+        assert result.total_score == pytest.approx(expected)
+        assert 0.10 < result.total_score < 0.18
+
+    def test_v2_specialist_vs_broad_gap(self):
+        """Specialist should score > 2x broad drug for single symptom."""
+        features_specialist = {"symptom_match": 0.57, "symptom_focus_ratio": 0.25, "age_suitability": 1.0, "otc_safety_level": 0.7}
+        features_broad = {"symptom_match": 0.35, "symptom_focus_ratio": 0.14, "age_suitability": 1.0, "otc_safety_level": 0.7}
+        exponents = {"focus": 0.5, "age": 0.3, "otc": 0.05}
+
+        specialist = score_one_v2(features_specialist, exponents, 1, "specialist")
+        broad = score_one_v2(features_broad, exponents, 2, "broad")
+
+        print(f"\n=== V2 Gap: specialist={specialist.total_score:.4f}, broad={broad.total_score:.4f} ===")
+        print(f"  Ratio: {specialist.total_score / broad.total_score:.2f}x")
+
+        assert specialist.total_score > broad.total_score * 2.0, (
+            f"Specialist ({specialist.total_score:.4f}) should be > 2x broad ({broad.total_score:.4f})"
+        )
+
+    def test_v2_multi_symptom_broad_can_win(self):
+        """Multi-symptom: broad drug with high sm + high focus can beat specialist with low sm."""
+        # 3 symptoms match: broad drug matches all 3, focus high
+        features_broad_multi = {"symptom_match": 0.80, "symptom_focus_ratio": 0.43, "age_suitability": 1.0, "otc_safety_level": 0.7}  # 3/7
+        features_specialist_single = {"symptom_match": 0.57, "symptom_focus_ratio": 0.25, "age_suitability": 1.0, "otc_safety_level": 0.7}  # 1/4
+        exponents = {"focus": 0.5, "age": 0.3, "otc": 0.05}
+
+        broad = score_one_v2(features_broad_multi, exponents, 1, "broad_multi")
+        specialist = score_one_v2(features_specialist_single, exponents, 2, "specialist_single")
+
+        print(f"\n=== V2 Multi-symptom: broad={broad.total_score:.4f}, specialist={specialist.total_score:.4f} ===")
+
+        # Broad with 3 matching symptoms should beat specialist with 1
+        assert broad.total_score > specialist.total_score, (
+            f"Multi-symptom broad ({broad.total_score:.4f}) should beat single-symptom specialist ({specialist.total_score:.4f})"
+        )
+
+    def test_v2_age_penalty_for_child(self):
+        """Child using adult drug: age_suitability=0.4 → 0.4^0.3 = 0.76."""
+        features = {"symptom_match": 0.57, "symptom_focus_ratio": 0.25, "age_suitability": 0.4, "otc_safety_level": 0.7}
+        exponents = {"focus": 0.5, "age": 0.3, "otc": 0.05}
+
+        result = score_one_v2(features, exponents, 1, "child_drug")
+
+        print(f"\n=== V2 Child Age Penalty: {result.total_score:.4f} ===")
+
+        expected_age_factor = 0.4 ** 0.3
+        print(f"  age_factor: {expected_age_factor:.4f} (0.4^{0.3})")
+        assert 0.55 < expected_age_factor < 0.80, f"Age penalty should be moderate, got {expected_age_factor:.3f}"
+
+    def test_v2_otc_tiebreaker_only(self):
+        """OTC should have near-zero impact: 乙类(1.0) vs 甲类(0.7) barely differs."""
+        features_a = {"symptom_match": 0.57, "symptom_focus_ratio": 0.25, "age_suitability": 1.0, "otc_safety_level": 1.0}  # 乙类
+        features_b = {"symptom_match": 0.57, "symptom_focus_ratio": 0.25, "age_suitability": 1.0, "otc_safety_level": 0.7}  # 甲类
+        exponents = {"focus": 0.5, "age": 0.3, "otc": 0.05}
+
+        score_a = score_one_v2(features_a, exponents, 1, "otc_b")
+        score_b = score_one_v2(features_b, exponents, 2, "otc_a")
+
+        gap = abs(score_a.total_score - score_b.total_score)
+        ratio = score_a.total_score / score_b.total_score
+
+        print(f"\n=== V2 OTC Tiebreaker: 乙类={score_a.total_score:.4f}, 甲类={score_b.total_score:.4f}, gap={gap:.4f}, ratio={ratio:.4f} ===")
+
+        # Gap should be very small (< 5%)
+        assert gap < 0.02, f"OTC gap should be < 0.02, got {gap:.4f}"
+
+    def test_v2_score_clamped_to_one(self):
+        """Score should be capped at 1.0."""
+        features = {"symptom_match": 1.0, "symptom_focus_ratio": 1.0, "age_suitability": 1.0, "otc_safety_level": 1.0}
+        exponents = {"focus": 0.5, "age": 0.3, "otc": 0.05}
+
+        result = score_one_v2(features, exponents, 1, "perfect")
+
+        assert result.total_score <= 1.0
+        assert result.total_score == pytest.approx(1.0)
+
+    def test_v2_missing_features_default_neutral(self):
+        """Missing features should default to 1.0 (neutral, no penalty)."""
+        features = {"symptom_match": 0.57}  # focus, age, otc all missing
+        exponents = {"focus": 0.5, "age": 0.3, "otc": 0.05}
+
+        result = score_one_v2(features, exponents, 1, "minimal")
+
+        # All missing = 1.0 neutral, so score = sm × 1.0 × 1.0 × 1.0 = sm
+        assert result.total_score == pytest.approx(0.57)
+
+    def test_v2_version_dispatch(self):
+        """score_one with scoring_version='v2' should use v2 formula."""
+        features = {"symptom_match": 0.57, "symptom_focus_ratio": 0.25, "age_suitability": 1.0, "otc_safety_level": 0.7}
+        exponents = {"focus": 0.5, "age": 0.3, "otc": 0.05}
+
+        v2_result = score_one(features, exponents, 1, "test", scoring_version="v2")
+        v2_direct = score_one_v2(features, exponents, 1, "test")
+
+        assert v2_result.total_score == v2_direct.total_score
+        assert v2_result.total_score < 0.5  # v2 score is lower than v1
+
+
+# ═══════════════════════════════════════════════════════════════
+# Test 6: Display normalization
+# ═══════════════════════════════════════════════════════════════
+
+class TestNormalizeForDisplay:
+    """Tests for normalize_for_display() — sigmoid confidence calibration.
+
+    Sigmoid parameters: k=12, midpoint=0.18
+    Formula: display = 100 / (1 + exp(-12 * (score - 0.18)))
+    """
+
+    def test_sigmoid_high_confidence(self):
+        """Excellent match (~0.49) → 97±2 (very high confidence)."""
+        sd = make_scored_drug(1, "A", 0.49)
+        result = normalize_for_display([sd])
+        # sigmoid(12 * 0.31) = 100/(1+e^-3.72) ≈ 97.6
+        assert 95 < result[0].display_score <= 100
+
+    def test_sigmoid_specialist_drug(self):
+        """Cough specialist (0.28) → 77±3 (good confidence)."""
+        sd = make_scored_drug(1, "右美沙芬", 0.28)
+        result = normalize_for_display([sd])
+        # sigmoid(12 * 0.10) = 100/(1+e^-1.20) ≈ 76.9
+        assert 73 < result[0].display_score < 81
+
+    def test_sigmoid_broad_spectrum(self):
+        """Broad drug (0.13) → 35±5 (moderate-low confidence)."""
+        sd = make_scored_drug(1, "酚麻美敏", 0.13)
+        result = normalize_for_display([sd])
+        # sigmoid(12 * -0.05) = 100/(1+e^0.60) ≈ 35.4
+        assert 30 < result[0].display_score < 41
+
+    def test_sigmoid_poor_match(self):
+        """Poor match (0.04) → ~16 (low confidence, not zero)."""
+        sd = make_scored_drug(1, "poor", 0.04)
+        result = normalize_for_display([sd])
+        # sigmoid(12 * -0.14) = 100/(1+e^1.68) ≈ 15.7
+        assert 10 < result[0].display_score < 22
+
+    def test_sigmoid_batch_independent(self):
+        """Same raw score → same display_score regardless of batch."""
+        sd1 = make_scored_drug(1, "A", 0.28)
+        sd2 = make_scored_drug(2, "B", 0.99)  # excellent drug in same batch
+        result = normalize_for_display([sd1, sd2])
+        # A's score should be ~77 regardless of B being in the batch
+        assert 73 < result[0].display_score < 81
+
+    def test_sigmoid_monotonic(self):
+        """Higher raw score → higher display_score (monotonicity)."""
+        sd1 = make_scored_drug(1, "A", 0.28)
+        sd2 = make_scored_drug(2, "B", 0.13)
+        sd3 = make_scored_drug(3, "C", 0.10)
+        result = normalize_for_display([sd1, sd2, sd3])
+        assert result[0].display_score > result[1].display_score > result[2].display_score
+
+    def test_no_drug_gets_100_for_moderate_match(self):
+        """A moderate match should not show as 100 — that's dishonest."""
+        sd = make_scored_drug(1, "A", 0.28)  # good but not perfect
+        result = normalize_for_display([sd])
+        assert result[0].display_score < 90, (
+            f"Moderate match shouldn't inflate to {result[0].display_score}"
+        )
+
+    def test_excluded_gets_zero(self):
+        """Excluded drugs should get display_score = 0."""
+        sd1 = make_scored_drug(1, "A", 0.57)
+        sd2 = make_scored_drug(2, "B", 0.0, excluded=True)
+        result = normalize_for_display([sd1, sd2])
+        assert result[1].display_score == 0.0
+
+    def test_all_excluded(self):
+        """All excluded → all display_score = 0."""
+        sd1 = make_scored_drug(1, "A", 0.0, excluded=True)
+        sd2 = make_scored_drug(2, "B", 0.0, excluded=True)
+        result = normalize_for_display([sd1, sd2])
+        assert result[0].display_score == 0.0
+
+    def test_perfect_score_reaches_high(self):
+        """A theoretically perfect match (1.0) → 100."""
+        sd = make_scored_drug(1, "perfect", 1.0)
+        result = normalize_for_display([sd])
+        assert result[0].display_score >= 99.9
+
+
+def make_scored_drug(drug_id, name, score, excluded=False):
+    """Helper to create a ScoredDrug for display normalization tests."""
+    from app.scorer.schemas import ScoredDrug
+    return ScoredDrug(
+        drug_id=drug_id,
+        generic_name=name,
+        total_score=score,
+        excluded=excluded,
+        exclude_reason="test" if excluded else "",
+    )

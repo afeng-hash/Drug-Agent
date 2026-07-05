@@ -1,25 +1,19 @@
 """
-ScoringEngine — 纯函数：FeatureVector × Weights → ScoredDrug 评分。
+ScoringEngine — 纯函数：FeatureVector × Config → ScoredDrug 评分。
 
 这是评分管线的第三步（第四步是排序后生成推荐文案）。
 完全确定性：无 IO、无随机数、无全局状态。相同输入 100% 可复现。
 
-核心公式（几何加权平均）：
-  total_score = exp( Σ w_i × ln(f_i) )
+支持两个评分公式版本（由 WeightConfig.scoring_version 控制）：
 
-  其中：
-    w_i = 归一化后的权重（Σw_i = 1.0）
-    f_i = 特征值，范围 (0, 1]
+  v1 — 几何加权平均（向后兼容）:
+    total_score = exp( Σ w_i × ln(f_i) ),  Σw_i = 1.0
+    四个特征作为平级维度，竞争同一份归一化权重预算。
 
-  几何平均的语义：
-    - f_i = 1.0 → 该维度对分数完全中性（不贡献，不惩罚）
-    - f_i → 0.0 → 分数趋近于 0（强惩罚）
-    - w_i 控制该维度的"弹性"——权重越大，该维度变化对分数的影响越大
-
-  为什么不用线性加权和？
-    线性模型下所有维度贡献"基线分"——safety=1.0 仍然给 +0.25 的加分，
-    导致安全维度挤占 symptom_match 的区分空间。几何平均中，值为 1.0
-    的特征不贡献任何分数，只负责"不惩罚"。
+  v2 — 层级乘法模型（推荐）:
+    total_score = symptom_match × focus_ratio^α × age_suitability^β × otc_safety_level^γ
+    symptom_match 是主排序信号（指数 1.0，不做任何压缩），
+    focus/age/otc 是乘法修正因子（指数 < 1.0 做软惩罚）。
 
 安全阈值（safety_threshold）：
   硬过滤已在评分前由 KG _filter_by_kg_contraindications 完成。
@@ -82,7 +76,7 @@ def _collect_evidence_reasons(
 # 核心评分函数
 # ═══════════════════════════════════════════════════════════════
 
-def score_one(
+def score_one_v1(
     features: dict[str, float],
     weights: dict[str, float],
     drug_id: int,
@@ -90,21 +84,19 @@ def score_one(
     safety_threshold: float = 0.2,
     evidence_details: list | None = None,
 ) -> ScoredDrug:
-    """对单个药品执行评分。
+    """v1 评分公式：几何加权平均。
 
     公式：total_score = exp( Σ (norm_w_i × ln(f_i)) )
     安全筛查：如果 safety < threshold → excluded=True
     （注意：KG 路径下安全硬过滤已在评分前完成）
 
     Args:
-        features:          EvidenceEngine 输出的特征向量，
-                          如 {"symptom_match": 0.57, "symptom_focus_ratio": 1.0, ...}
-        weights:           原始权重配置（内部会归一化），
-                          如 {"symptom_match": 50, "symptom_focus_ratio": 15, ...}
+        features:          EvidenceEngine 输出的特征向量
+        weights:           原始权重配置（内部会归一化）
         drug_id:           药品 ID
         generic_name:      药品通用名
-        safety_threshold:  safety 特征的排除阈值。safety < 此值则排除该药品
-        evidence_details:  可选的 EvidenceResult 列表（用于生成维度解释）
+        safety_threshold:  safety 特征的排除阈值
+        evidence_details:  可选的 EvidenceResult 列表
 
     Returns:
         ScoredDrug：含总分、各维度明细、排除标记
@@ -162,12 +154,149 @@ def score_one(
     )
 
 
+def score_one_v2(
+    features: dict[str, float],
+    exponents: dict[str, float],
+    drug_id: int,
+    generic_name: str,
+    evidence_details: list | None = None,
+) -> ScoredDrug:
+    """v2 评分公式：层级乘法模型。
+
+    公式：
+      score = symptom_match × focus_ratio^α × age_suitability^β × otc_safety_level^γ
+
+    其中：
+      - symptom_match 是主排序信号（指数 1.0，不做任何压缩）
+      - focus_ratio   是纯度折扣（α=0.5 即 sqrt，专药温和惩罚/广谱药显著惩罚）
+      - age_suitability 是年龄软惩罚（β=0.3，非成人适度惩罚）
+      - otc_safety_level 是 OTC 弱 tiebreaker（γ=0.05，几乎不影响）
+
+    缺失特征使用中性默认值（1.0 = 无惩罚）。
+
+    Args:
+        features:   EvidenceEngine 输出的特征向量
+        exponents:  惩罚指数 {"focus": 0.5, "age": 0.3, "otc": 0.05}
+        drug_id:    药品 ID
+        generic_name: 药品通用名
+        evidence_details: 可选的 EvidenceResult 列表
+
+    Returns:
+        ScoredDrug：含总分、各维度明细、排除标记
+    """
+    # ── 提取特征值（缺失 → 中性默认 1.0） ──
+    sm = max(features.get("symptom_match", 0.5), 1e-8)
+    focus = max(features.get("symptom_focus_ratio", 1.0), 1e-8)
+    age = max(features.get("age_suitability", 1.0), 1e-8)
+    otc = max(features.get("otc_safety_level", 1.0), 1e-8)
+
+    # ── 提取指数（缺失 → 默认值） ──
+    alpha = exponents.get("focus", 0.5)
+    beta = exponents.get("age", 0.3)
+    gamma = exponents.get("otc", 0.05)
+
+    # ── 层级乘法 ──
+    focus_factor = focus ** alpha
+    age_factor = age ** beta
+    otc_factor = otc ** gamma
+
+    total_score = round(sm * focus_factor * age_factor * otc_factor, 4)
+    total_score = min(total_score, 1.0)
+
+    # ── 构建维度明细 ──
+    reasons_sm = _collect_evidence_reasons("symptom_match", evidence_details or [])
+    reasons_focus = _collect_evidence_reasons("symptom_focus_ratio", evidence_details or [])
+    reasons_age = _collect_evidence_reasons("age_suitability", evidence_details or [])
+    reasons_otc = _collect_evidence_reasons("otc_safety_level", evidence_details or [])
+
+    dimensions = [
+        DimensionScore(
+            feature_name="symptom_match",
+            weight=1.0,
+            feature_value=sm,
+            contribution=round(sm, 6),
+            evidence_reasons=reasons_sm,
+        ),
+        DimensionScore(
+            feature_name="symptom_focus_ratio",
+            weight=alpha,
+            feature_value=focus,
+            contribution=round(focus_factor, 6),
+            evidence_reasons=reasons_focus,
+        ),
+        DimensionScore(
+            feature_name="age_suitability",
+            weight=beta,
+            feature_value=age,
+            contribution=round(age_factor, 6),
+            evidence_reasons=reasons_age,
+        ),
+        DimensionScore(
+            feature_name="otc_safety_level",
+            weight=gamma,
+            feature_value=otc,
+            contribution=round(otc_factor, 6),
+            evidence_reasons=reasons_otc,
+        ),
+    ]
+
+    return ScoredDrug(
+        drug_id=drug_id,
+        generic_name=generic_name,
+        total_score=total_score,
+        dimensions=dimensions,
+        excluded=False,
+    )
+
+
+def score_one(
+    features: dict[str, float],
+    weights: dict[str, float],
+    drug_id: int,
+    generic_name: str,
+    safety_threshold: float = 0.2,
+    evidence_details: list | None = None,
+    scoring_version: str = "v1",
+) -> ScoredDrug:
+    """版本分发入口：根据 scoring_version 路由到 v1 或 v2 公式。
+
+    Args:
+        features:         EvidenceEngine 输出的特征向量
+        weights:          v1=几何权重, v2=惩罚指数
+        drug_id:          药品 ID
+        generic_name:     药品通用名
+        safety_threshold: 安全排除阈值（仅 v1 使用）
+        evidence_details: 可选的 EvidenceResult 列表
+        scoring_version:  "v1" | "v2"
+
+    Returns:
+        ScoredDrug
+    """
+    if scoring_version == "v2":
+        return score_one_v2(
+            features=features,
+            exponents=weights,  # weights 字段在 v2 中存储的是 exponents
+            drug_id=drug_id,
+            generic_name=generic_name,
+            evidence_details=evidence_details,
+        )
+    return score_one_v1(
+        features=features,
+        weights=weights,
+        drug_id=drug_id,
+        generic_name=generic_name,
+        safety_threshold=safety_threshold,
+        evidence_details=evidence_details,
+    )
+
+
 def score_all(
     drugs: list,
     features_list: list[dict[str, float]],
     weights: dict[str, float],
     safety_threshold: float = 0.2,
     evidence_details_list: list[list] | None = None,
+    scoring_version: str = "v1",
 ) -> ScoringResult:
     """批量评分并排序所有候选药品。
 
@@ -178,9 +307,10 @@ def score_all(
     Args:
         drugs:                 Drug ORM 实例列表
         features_list:         每个药品的 FeatureVector，与 drugs 一一对应
-        weights:               原始权重配置
-        safety_threshold:      safety 排除阈值
+        weights:               v1=几何权重, v2=惩罚指数
+        safety_threshold:      safety 排除阈值（仅 v1 使用）
         evidence_details_list: 每个药品的 EvidenceResult 列表（可选）
+        scoring_version:       "v1" | "v2"
 
     Returns:
         ScoringResult：已排序的药品列表 + 性能耗时
@@ -198,6 +328,7 @@ def score_all(
             generic_name=drug.generic_name,
             safety_threshold=safety_threshold,
             evidence_details=details,
+            scoring_version=scoring_version,
         )
         scored.append(sd)
 
@@ -210,3 +341,68 @@ def score_all(
         drugs=scored,
         total_time_ms=round(elapsed, 3),
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 对外展示 — Sigmoid 置信度校准
+# ═══════════════════════════════════════════════════════════════
+
+# Sigmoid 校准参数（针对 v2 层级乘法模型的分数分布调校）
+#   k: 陡峭度——越大过渡越急，越小越平缓
+#   midpoint: 置信度 50 分对应的原始分数阈值
+#
+# 锚点验证（k=12, midpoint=0.18）：
+#   v2=0.49 (完美) → 97 分    v2=0.28 (专药) → 77 分
+#   v2=0.13 (广谱) → 35 分    v2=0.04 (差)   → 16 分
+SIGMOID_K = 12.0
+SIGMOID_MIDPOINT = 0.18
+
+
+def _sigmoid_calibrate(raw_score: float, scale: float = 100.0) -> float:
+    """将原始分通过 sigmoid 映射为置信度分数。
+
+    sigmoid(x) = scale / (1 + exp(-k * (x - midpoint)))
+
+    特性：
+      - 非线性饱和：高分端和低分端都平缓（不会虚高到 100 或归零）
+      - 绝对可比：同一原始分在不同批次映射到相同置信度
+      - 中间陡峭：在 midpoint 附近区分度最大
+    """
+    import math
+    return scale / (1.0 + math.exp(-SIGMOID_K * (raw_score - SIGMOID_MIDPOINT)))
+
+
+def normalize_for_display(
+    scored_drugs: list[ScoredDrug],
+    scale: float = 100.0,
+) -> list[ScoredDrug]:
+    """Sigmoid 置信度校准：将原始分映射为绝对置信度分数。
+
+    与排名归一化（min-max / top-relative）的本质区别：
+      - 排名归一化回答"这批里谁最好？"——分数随批次波动，最好的永远 100
+      - 置信度校准回答"这个推荐有多可信？"——分数是绝对的，诚实反映匹配置信度
+
+    校准后分数的直觉含义：
+      90+  → 极高置信度（完美匹配，罕见）
+      70-89 → 高置信度（专药精准匹配）
+      40-69 → 中等置信度（能用但不是最优）
+      20-39 → 低置信度（勉强相关）
+      <20   → 极低置信度（基本不相关）
+
+    Args:
+        scored_drugs: 评分后的药品列表（已排序）
+        scale:        分数上限，默认 100
+
+    Returns:
+        同列表，每个 ScoredDrug.display_score 已填充
+    """
+    active = [d for d in scored_drugs if not d.excluded]
+
+    for d in active:
+        d.display_score = round(_sigmoid_calibrate(d.total_score, scale), 1)
+
+    for d in scored_drugs:
+        if d.excluded:
+            d.display_score = 0.0
+
+    return scored_drugs

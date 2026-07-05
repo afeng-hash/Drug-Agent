@@ -47,7 +47,7 @@ async def seed():
             db.add(drug)
 
         await db.commit()
-        print(f"✅ Inserted {len(drugs_data)} drugs")
+        print(f"[OK] Inserted {len(drugs_data)} drugs")
 
         # ── Inventory ──
         with open(os.path.join(data_dir, "inventory.json"), "r", encoding="utf-8") as f:
@@ -59,26 +59,28 @@ async def seed():
             drug_name = item.pop("drug_generic_name")
             drug = await drug_repo.find_by_name(drug_name)
             if not drug:
-                print(f"⚠️  Drug not found: {drug_name}, skipping inventory item")
+                print(f"[WARN]  Drug not found: {drug_name}, skipping inventory item")
                 continue
             inv = Inventory(drug_id=drug.id, **item)
             db.add(inv)
             count += 1
 
         await db.commit()
-        print(f"✅ Inserted {count} inventory items")
+        print(f"[OK] Inserted {count} inventory items")
 
     # ── Weight Config (default) ──
     async with session_factory() as db:
         from app.db.models import WeightConfig
         from sqlalchemy import select as sa_select
 
+        # v1.0.0 — 几何加权平均（向后兼容）
         existing = await db.execute(
             sa_select(WeightConfig).where(WeightConfig.version == "v1.0.0")
         )
         if not existing.scalar_one_or_none():
             config = WeightConfig(
                 version="v1.0.0",
+                scoring_version="v1",
                 policy="balanced",
                 weights={
                     "symptom_match": 0.50,
@@ -94,14 +96,39 @@ async def seed():
                 },
                 safety_block_threshold=0.2,
                 is_active=True,
-                description="初始默认权重：均衡推荐策略",
+                description="v1 几何加权平均：均衡推荐策略",
                 changed_by="seed",
             )
             db.add(config)
             await db.commit()
-            print("✅ Inserted default weight config v1.0.0")
+            print("[OK] Inserted default weight config v1.0.0")
         else:
-            print("ℹ️  Weight config v1.0.0 already exists")
+            print("[INFO]  Weight config v1.0.0 already exists")
+
+        # v2.0.0 — 层级乘法模型（推荐使用）
+        existing_v2 = await db.execute(
+            sa_select(WeightConfig).where(WeightConfig.version == "v2.0.0")
+        )
+        if not existing_v2.scalar_one_or_none():
+            config_v2 = WeightConfig(
+                version="v2.0.0",
+                scoring_version="v2",
+                policy="balanced",
+                weights={
+                    "focus": 0.5,
+                    "age": 0.3,
+                    "otc": 0.05,
+                },
+                safety_block_threshold=0.2,
+                is_active=True,
+                description="v2 层级乘法模型：主得分×√聚焦率×年龄软惩罚×OTC弱调节",
+                changed_by="seed",
+            )
+            db.add(config_v2)
+            await db.commit()
+            print("[OK] Inserted default weight config v2.0.0")
+        else:
+            print("[INFO]  Weight config v2.0.0 already exists")
 
     # ── Neo4j Knowledge Graph ──
     try:
@@ -114,12 +141,12 @@ async def seed():
             kg_dir = os.path.join(data_dir, "kg")
             sync = GraphDataSync(kg_client, kg_dir)
             stats = await sync.seed_all()
-            print(f"✅ KG seeded: {stats['nodes']} nodes, {stats['relationships']} relationships")
+            print(f"[OK] KG seeded: {stats['nodes']} nodes, {stats['relationships']} relationships")
             await kg_client.close()
         else:
-            print("⚠️  Neo4j not available — KG seed skipped")
+            print("[WARN]  Neo4j not available — KG seed skipped")
     except Exception as e:
-        print(f"⚠️  KG seed skipped (Neo4j may not be available): {e}")
+        print(f"[WARN]  KG seed skipped (Neo4j may not be available): {e}")
 
     # ── RAG Documents ──
     llm_client = LLMClient(settings)
@@ -129,14 +156,14 @@ async def seed():
         rag_dir = os.path.join(data_dir, "rag_docs")
         if os.path.isdir(rag_dir) and os.listdir(rag_dir):
             chunk_count = await ingest_documents(rag_dir, llm_client, retriever)
-            print(f"✅ Ingested {chunk_count} RAG chunks into Milvus")
+            print(f"[OK] Ingested {chunk_count} RAG chunks into Milvus")
         else:
-            print("⚠️  No RAG documents found in data/rag_docs/")
+            print("[WARN]  No RAG documents found in data/rag_docs/")
     except Exception as e:
-        print(f"⚠️  RAG ingestion skipped (Milvus may not be available): {e}")
+        print(f"[WARN]  RAG ingestion skipped (Milvus may not be available): {e}")
 
     await engine.dispose()
-    print("\n🎉 Seed data import complete!")
+    print("\n[DONE] Seed data import complete!")
 
 
 if __name__ == "__main__":

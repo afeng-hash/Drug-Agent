@@ -99,6 +99,10 @@ class ScoredDrug:
     """加权总分 Σ(wᵢ × fᵢ)，已归一化到 0.0 ~ 1.0。
     排序时按此字段降序排列"""
 
+    display_score: float = 0.0
+    """对外展示分（0-100），由 normalize_for_display() 填充。
+    v2 原始分范围较宽，批次内 min-max 归一化后更直观"""
+
     dimensions: list[DimensionScore] = field(default_factory=list)
     """各维度的得分明细。可用于生成解释文本或可视化"""
 

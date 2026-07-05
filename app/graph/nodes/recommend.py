@@ -27,6 +27,7 @@ from app.llm.client import LLMClient
 from app.rag.retriever import DrugManualRetriever
 from app.rag.schemas import Chunk
 from app.scorer.pipeline import ScoringPipeline
+from app.scorer.engine import normalize_for_display
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,9 @@ async def recommend_node(
         weight_repo=weight_repo,
     )
 
+    # ── 4.5 对外展示归一化（批次内 min-max → 0-100） ──
+    scoring_result.drugs = normalize_for_display(scoring_result.drugs)
+
     # Filter out excluded drugs, take top 3
     active_drugs = [sd for sd in scoring_result.drugs if not sd.excluded]
     top_drugs = active_drugs[:3]
@@ -151,7 +155,7 @@ async def recommend_node(
             "drug_id": sd.drug_id,
             "generic_name": sd.generic_name,
             "match_reason": reasons_map.get(sd.drug_id, "根据您的症状匹配推荐"),
-            "score": sd.total_score,
+            "score": sd.display_score,
         }
         for sd in top_drugs
     ]
@@ -389,7 +393,7 @@ def _build_response(
 
         lines.append("---")
         lines.append(f"### {i}. **{rec['generic_name']}**{brands}")
-        lines.append(f"**评分**: {rec['score']:.2f}  |  **推荐理由**: {rec['match_reason']}\n")
+        lines.append(f"**评分**: {rec['score']:.0f}分  |  **推荐理由**: {rec['match_reason']}\n")
 
         # 作用功效（RAG 优先 → DB 降级）
         efficacy = _extract_efficacy(chunks, drug)

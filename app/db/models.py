@@ -300,11 +300,20 @@ class WeightConfig(Base):
     policy: Mapped[str] = mapped_column(String(50), nullable=False, default="balanced")
     """策略名：'balanced' | 'safety_first'"""
 
+    scoring_version: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    """评分公式版本：
+      - None / 'v1' → 几何加权平均（score = Π f_i^w_i, Σw_i=1.0）
+      - 'v2'       → 层级乘法模型（score = sm × focus^α × age^β × otc^γ）
+    """
+
     weights: Mapped[dict] = mapped_column(JSON, nullable=False)
-    """权重 JSON：{"symptom_match": 0.30, "safety": 0.25, "age_suitability": 0.20, ...}"""
+    """权重/指数 JSON：
+      v1: 几何权重 {"symptom_match": 0.50, "symptom_focus_ratio": 0.15, ...}
+      v2: 惩罚指数 {"focus": 0.5, "age": 0.3, "otc": 0.05}
+    """
 
     feature_defaults: Mapped[dict] = mapped_column(JSON, default=dict)
-    """特征默认值 JSON：{"symptom_match": 0.0, "safety": 1.0, ...}"""
+    """特征默认值 JSON（仅 v1 使用）：{"symptom_match": 0.0, "safety": 1.0, ...}"""
 
     safety_block_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.2)
     """安全排除阈值：safety < 此值 → 药品不推荐"""

@@ -103,13 +103,16 @@ class ScoringPipeline:
         try:
             # ── 1. 加载权重配置（含 A/B 路由） ──
             config = await weight_repo.get_active(session_id)
+            scoring_version = getattr(config, 'scoring_version', None) or "v1"
             _logger.info(
-                "ScoringPipeline: config version=%s policy=%s weights=%s",
-                config.version, config.policy, config.weights,
+                "ScoringPipeline: version=%s scoring=%s policy=%s config=%s",
+                config.version, scoring_version, config.policy, config.weights,
             )
 
             # ── 2. 校验配置 ──
-            is_valid, reason = self._validator.validate(config.weights, config.policy)
+            is_valid, reason = self._validator.validate(
+                config.weights, config.policy, scoring_version=scoring_version,
+            )
             if not is_valid:
                 _logger.warning("Weight config validation warning: %s", reason)
 
@@ -135,6 +138,7 @@ class ScoringPipeline:
                 weights=config.weights,
                 safety_threshold=config.safety_block_threshold,
                 evidence_details_list=evidence_details_list,
+                scoring_version=scoring_version,
             )
 
             for sd in result.drugs:
