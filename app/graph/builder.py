@@ -20,8 +20,13 @@ from langgraph.graph import END, StateGraph
 
 from app.agent.prompts import REACT_SYSTEM_PROMPT
 from app.agent.react.agent import ReactAgent
-from app.agent.react.schemas import ToolDefinition
 from app.agent.react.tools import ToolRegistry
+from app.agent.react.tools.base import BaseTool
+from app.agent.react.tools.get_drug_detail import GetDrugDetailTool
+from app.agent.react.tools.get_recommendation import GetRecommendationTool
+from app.agent.react.tools.get_user_profile import GetUserProfileTool
+from app.agent.react.tools.search_drug import SearchDrugTool
+from app.agent.react.tools.search_manual import SearchManualTool
 from app.graph.nodes.consult import consult_node
 from app.graph.nodes.dispatcher import dispatcher_node
 from app.graph.nodes.end import end_node
@@ -204,88 +209,34 @@ def _make_react(
 ):
     """创建 react 节点的闭包。
 
-    工厂内完成：
-      1. ToolRegistry + 5 个工具注册
-      2. ReactAgent 实例化
-      3. react_node 的 partial 绑定
+    使用工具类架构——每个工具是一个 BaseTool 子类。
+    加新工具只需在 tools 列表里加一行。
     """
     state_proxy = _StateProxy()
+
+    # ── 工具列表（加新工具 = 加一行） ──
+    tools: list[BaseTool] = [
+        # 药品信息类
+        SearchDrugTool(drug_repo_factory=drug_repo_factory),
+        GetDrugDetailTool(drug_repo_factory=drug_repo_factory),
+        SearchManualTool(retriever=retriever),
+        # 状态读取类
+        GetRecommendationTool(state_proxy=state_proxy),
+        GetUserProfileTool(state_proxy=state_proxy),
+    ]
+
+    # ── 注册工具 ──
     registry = ToolRegistry()
+    for tool in tools:
+        registry.register(tool.definition, tool.execute)
 
-    # 工具 1: search_drug
-    registry.register(
-        ToolDefinition(
-            name="search_drug",
-            description="搜索药品。根据药品名称（通用名/商品名/拼音）模糊搜索，返回匹配的药品列表。",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "药品名称关键词"},
-                    "limit": {"type": "integer", "description": "返回数量上限，默认 5"},
-                },
-                "required": ["query"],
-            },
-        ),
-        _make_search_drug(drug_repo_factory),
-    )
+    # ── 构建增强 system prompt（自动注入容错矩阵） ──
+    enhanced_prompt = REACT_SYSTEM_PROMPT + _build_tool_fallback_section(tools)
 
-    # 工具 2: get_drug_detail
-    registry.register(
-        ToolDefinition(
-            name="get_drug_detail",
-            description="获取药品完整信息：适应症、用法用量、不良反应、禁忌、相互作用等。",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "drug_name": {"type": "string", "description": "药品通用名"},
-                },
-                "required": ["drug_name"],
-            },
-        ),
-        _make_get_drug_detail(drug_repo_factory, retriever),
-    )
-
-    # 工具 3: search_manual
-    registry.register(
-        ToolDefinition(
-            name="search_manual",
-            description="在药品说明书中检索与用户问题相关的片段。",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "drug_name": {"type": "string", "description": "药品名称"},
-                    "question": {"type": "string", "description": "用户关心的问题"},
-                    "top_k": {"type": "integer", "description": "返回片段数量，默认 5"},
-                },
-                "required": ["drug_name", "question"],
-            },
-        ),
-        _make_search_manual(retriever),
-    )
-
-    # 工具 4: get_recommendation
-    registry.register(
-        ToolDefinition(
-            name="get_recommendation",
-            description="获取系统当前已推荐的药品列表。用于解析'这个药'等指代。",
-            parameters={"type": "object", "properties": {}},
-        ),
-        _make_get_recommendation(state_proxy),
-    )
-
-    # 工具 5: get_user_profile
-    registry.register(
-        ToolDefinition(
-            name="get_user_profile",
-            description="获取用户个人信息（年龄、过敏史、慢性病、特殊人群等）。用于个性化回答。",
-            parameters={"type": "object", "properties": {}},
-        ),
-        _make_get_user_profile(state_proxy),
-    )
-
+    # ── 创建 ReactAgent ──
     react_agent = ReactAgent(
         llm_client=llm_client,
-        system_prompt=REACT_SYSTEM_PROMPT,
+        system_prompt=enhanced_prompt,
         tool_registry=registry,
         profile=react_profile,
         max_iterations=5,
@@ -329,81 +280,42 @@ def _make_end(session_repo_factory, safety_log_repo_factory):
 
 
 # ═══════════════════════════════════════════════════════════
-# 工具 Executor 工厂
+# 容错矩阵自动生成
 # ═══════════════════════════════════════════════════════════
 
-def _make_search_drug(drug_repo_factory):
-    async def execute(query: str, limit: int = 5):
-        async with drug_repo_factory() as repo:
-            results = await repo.search(query, limit=limit)
-            return [
-                {
-                    "drug_id": getattr(r, "drug_id", r.get("drug_id", "")),
-                    "generic_name": getattr(r, "generic_name", r.get("generic_name", "")),
-                    "trade_names": getattr(r, "trade_names", r.get("trade_names", "")),
-                }
-                for r in results
-            ]
-    return execute
 
+def _build_tool_fallback_section(tools: list[BaseTool]) -> str:
+    """从工具元数据自动生成容错策略段落，注入到 system prompt 末尾。
 
-def _make_get_drug_detail(drug_repo_factory, retriever):
-    async def execute(drug_name: str):
-        async with drug_repo_factory() as repo:
-            drug = await repo.get_by_name(drug_name)
-            if not drug:
-                return {"error": f"未找到药品：{drug_name}"}
-            drug_dict = drug if isinstance(drug, dict) else {
-                "drug_id": getattr(drug, "drug_id", None),
-                "generic_name": getattr(drug, "generic_name", drug_name),
-                "trade_names": getattr(drug, "trade_names", ""),
-                "category": getattr(drug, "category", ""),
-                "indications": getattr(drug, "indications", ""),
-                "usage_dosage": getattr(drug, "usage_dosage", ""),
-                "adverse_reactions": getattr(drug, "adverse_reactions", ""),
-                "contraindications": getattr(drug, "contraindications", ""),
-                "interactions": getattr(drug, "interactions", ""),
-                "precautions": getattr(drug, "precautions", ""),
-            }
-            if retriever:
-                try:
-                    chunks = await retriever.retrieve_multi(
-                        drug_name, question="适应症 不良反应 禁忌 用法用量", top_k=5
-                    )
-                    drug_dict["manual_chunks"] = [
-                        c.content if hasattr(c, "content") else str(c) for c in chunks
-                    ]
-                except Exception:
-                    pass
-            return drug_dict
-    return execute
+    遍历所有工具的 fallback_tools，生成工具替代关系表。
+    这样 LLM 知道每个工具失败后可以尝试哪些替代工具。
+    """
+    lines = [
+        "",
+        "## 工具容错策略（重要）",
+        "",
+        '如果某个工具返回了 error（不是"未找到"，而是执行失败），'
+        '不要立即放弃——可能有替代工具可以使用。请按以下策略尝试：',
+        "",
+    ]
 
+    for tool in tools:
+        if tool.fallback_tools:
+            name = tool.definition.name
+            fallbacks = "、".join(tool.fallback_tools)
+            lines.append(f"- **{name} 失败** → 尝试 {fallbacks}")
 
-def _make_search_manual(retriever):
-    async def execute(drug_name: str, question: str, top_k: int = 5):
-        if not retriever:
-            return {"error": "说明书检索服务不可用"}
-        try:
-            chunks = await retriever.retrieve_multi(drug_name, question=question, top_k=top_k)
-            return [
-                {
-                    "content": c.content if hasattr(c, "content") else str(c),
-                    "source": getattr(c, "source", "") if hasattr(c, "source") else "",
-                }
-                for c in chunks
-            ]
-        except Exception as e:
-            return {"error": f"检索失败：{str(e)}"}
-    return execute
+    lines.append("")
+    lines.append(
+        '注意：get_recommendation 和 get_user_profile 没有替代工具'
+        '——如果它们失败，跳过个性化部分，用通用方式回答。'
+    )
+    lines.append("")
+    lines.append(
+        '⚠️ **最终底线**：只有在所有相关替代工具都失败后，'
+        '才能告知用户“抱歉，药品查询服务暂时不可用，'
+        '建议您稍后再试或咨询药师”。'
+        '在此之前，绝对不能凭训练数据编造药品信息。'
+    )
 
-
-def _make_get_recommendation(state_proxy: _StateProxy):
-    async def execute():
-        return list(state_proxy.recommendations)
-    return execute
-
-
-def _make_get_user_profile(state_proxy: _StateProxy):
-    async def execute():
-        return dict(state_proxy.user_profile)
-    return execute
+    return "\n".join(lines)

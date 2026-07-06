@@ -38,6 +38,36 @@ class DrugRepository:
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def search(self, query: str, limit: int = 5) -> list[Drug]:
+        """按药品名称模糊搜索（通用名/商品名/拼音）。
+
+        用于 search_drug 工具——用户在对话中提到药品名或关键词时，
+        快速定位匹配的药品。
+
+        如 search("布洛芬", limit=5) → 返回 generic_name 或 trade_names
+        中包含"布洛芬"的药品列表。
+
+        Args:
+            query: 药品名称关键词（支持通用名、商品名、拼音）
+            limit: 返回数量上限
+
+        Returns:
+            匹配的药品列表（按通用名排序）
+        """
+        stmt = (
+            select(Drug)
+            .where(
+                or_(
+                    Drug.generic_name.ilike(f"%{query}%"),
+                    Drug.trade_names.ilike(f"%{query}%"),
+                )
+            )
+            .order_by(Drug.generic_name)
+            .limit(limit)
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
     async def find_by_symptoms(
         self, symptoms: list[str], category: str = "感冒退烧"
     ) -> list[Drug]:

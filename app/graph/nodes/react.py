@@ -47,6 +47,7 @@ async def react_node(
 
     # 没有显式 query → 取最后一条用户消息
     if not query:
+        #todo 消息顺序乱了
         normalized = normalize_messages(messages)
         for m in reversed(normalized):
             if m.get("role") == "user":
@@ -59,6 +60,8 @@ async def react_node(
     recommendations = state.get("recommendations", [])
     consult_next_action = state.get("consult_next_action", "")
 
+    #todo 此时是workflow问完了，然后用户又问了上面药哪些孕妇不能用
+    # todo 但是此时 consult_next_action 状态为 ask，workflow_response为 ''，recommendations有信息
     if workflow_response or recommendations:
         workflow_context = {
             "workflow_action": "done" if consult_next_action == "done" else "ask",

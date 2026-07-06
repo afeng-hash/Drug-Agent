@@ -16,6 +16,7 @@ from app.agent.react.schemas import (
     WorkingMemory,
 )
 from app.agent.react.tools import ToolRegistry
+from app.agent.react.tools.base import BaseTool
 
 __all__ = [
     "ReactAgent",
@@ -27,4 +28,5 @@ __all__ = [
     "ToolResult",
     "WorkingMemory",
     "WorkingMemoryRuntime",
+    "BaseTool",
 ]

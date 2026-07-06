@@ -95,6 +95,25 @@ class DrugManualRetriever:
         collection.create_index(field_name="vector", index_params=index_params)
         collection.load()  # 加载到内存
 
+    async def retrieve_multi(
+        self, drug_name: str, question: str, top_k: int = 5
+    ) -> list[Chunk]:
+        """检索与查询最相关的药品说明书片段（多用途接口）。
+
+        与 retrieve() 功能相同，但参数命名更语义化：
+          - question 替代 query（更贴近用户场景）
+          - 由 search_manual 和 get_drug_detail 工具调用
+
+        Args:
+            drug_name: 药品通用名（用于过滤）
+            question:  用户关心的问题，如 "副作用" "孕妇能用吗"
+            top_k:     返回的最相似结果数量
+
+        Returns:
+            按相似度降序排列的 Chunk 列表
+        """
+        return await self.retrieve(drug_name, query=question, top_k=top_k)
+
     async def retrieve(
         self, drug_name: str, query: str, top_k: int = 5
     ) -> list[Chunk]:
