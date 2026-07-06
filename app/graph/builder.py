@@ -20,6 +20,13 @@ from langgraph.graph import END, StateGraph
 
 from app.agent.prompts import REACT_SYSTEM_PROMPT
 from app.agent.react.agent import ReactAgent
+from app.agent.react.skills import (
+    SOPEngine,
+    SkillRouter,
+    TaskClassifier,
+    ResponseGenerator,
+    TASK_SOP_MAP,
+)
 from app.agent.react.tools import ToolRegistry
 from app.agent.react.tools.base import BaseTool
 from app.agent.react.tools.get_drug_detail import GetDrugDetailTool
@@ -212,23 +219,24 @@ def _make_react(
 ):
     """创建 react 节点的闭包。
 
-    使用工具类架构——每个工具是一个 BaseTool 子类。
-    加新工具只需在 tools 列表里加一行。
+    Skills 架构（v3）：
+      - TaskClassifier (LLM #1): 语义分类 + 参数提取
+      - SOPEngine (Code):       确定性工具链执行
+      - ResponseGenerator (LLM #2): 结构化数据 → 自然语言
+      - SkillRouter (Code):     intent → task_type 确定性路由
+      - ReactAgent (fallback):  处理闲聊和未分类查询
     """
     state_proxy = _StateProxy()
 
     # ── 联网搜索服务（Tavily） ──
     web_search_service = TavilySearchService(Settings())
 
-    # ── 工具列表（加新工具 = 加一行） ──
+    # ── 工具列表（SOPEngine + ReactAgent fallback 共享） ──
     tools: list[BaseTool] = [
-        # 药品信息类（本地）
         SearchDrugTool(drug_repo_factory=drug_repo_factory),
         GetDrugDetailTool(drug_repo_factory=drug_repo_factory),
         SearchManualTool(retriever=retriever),
-        # 联网搜索兜底
         SearchWebTool(web_search_service=web_search_service),
-        # 状态读取类
         GetRecommendationTool(state_proxy=state_proxy),
         GetUserProfileTool(state_proxy=state_proxy),
     ]
@@ -238,10 +246,29 @@ def _make_react(
     for tool in tools:
         registry.register(tool.definition, tool.execute)
 
-    # ── 构建增强 system prompt（自动注入容错矩阵） ──
+    # ── Skills 组件 ──
+    skill_router = SkillRouter()
+    sop_engine = SOPEngine(tool_registry=registry)
+
+    # TaskClassifier: 低 temperature 保证分类一致性
+    classifier_profile = LLMProfile(
+        model=react_profile.model if react_profile else "qwen-plus",
+        temperature=0.1,
+        max_tokens=512,
+    )
+    task_classifier = TaskClassifier(
+        llm_client=llm_client,
+        profile=classifier_profile,
+    )
+    response_generator = ResponseGenerator(
+        llm_client=llm_client,
+        profile=react_profile,
+    )
+
+    # ── 构建增强 system prompt（ReAct fallback 用） ──
     enhanced_prompt = REACT_SYSTEM_PROMPT + _build_tool_fallback_section(tools)
 
-    # ── 创建 ReactAgent ──
+    # ── 创建 ReactAgent fallback ──
     react_agent = ReactAgent(
         llm_client=llm_client,
         system_prompt=enhanced_prompt,
@@ -255,6 +282,10 @@ def _make_react(
             state=state,
             react_agent=react_agent,
             state_proxy=state_proxy,
+            skill_router=skill_router,
+            sop_engine=sop_engine,
+            task_classifier=task_classifier,
+            response_generator=response_generator,
         )
 
     return wrapped
