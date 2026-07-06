@@ -58,6 +58,7 @@ async def consult_node(
     messages = state.get("messages", [])
     slots = state.get("consult_slots", {})
     dispatcher_result = state.get("dispatcher_result", {})
+    #todo
     dispatcher_params = dispatcher_result.get("params", {})
     dispatcher_intent = dispatcher_result.get("intent", "")
     consult_rounds = state.get("consult_rounds", 0)

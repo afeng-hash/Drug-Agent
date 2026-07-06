@@ -6,6 +6,8 @@ Application configuration — pydantic-settings.
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.llm.profile import LLMProfile
+
 
 class Settings(BaseSettings):
     """应用全局配置。
@@ -40,6 +42,22 @@ class Settings(BaseSettings):
 
     embedding_model: str = "text-embedding-v3"
     """嵌入模型名称。用于生成 RAG 检索用的文本向量"""
+
+    # ── 多 Profile 配置 ──────────────────────────────────
+    # 每个场景独立配置 LLMProfile。字段为 dict 类型，通过 get_profile() 转为 LLMProfile 对象。
+    # 环境变量覆盖示例：LLM_DISPATCHER='{"model":"qwen-turbo","temperature":0.1}'
+
+    llm_dispatcher: dict = {"model": "qwen-turbo", "temperature": 0.1, "max_tokens": 256}
+    """Dispatcher 的 LLMProfile。快速模型 + 低温度保证路由稳定性"""
+
+    llm_consult: dict = {"model": "qwen-plus", "temperature": 0.3, "max_tokens": 1024}
+    """Consult Agent 的 LLMProfile。准确模型 + 中等温度"""
+
+    llm_react: dict = {"model": "qwen-plus", "temperature": 0.3, "max_tokens": 1024}
+    """ReactAgent 的 LLMProfile。推理模型 + 平衡温度"""
+
+    llm_recommend: dict = {"model": "qwen-plus", "temperature": 0.3, "max_tokens": 512}
+    """Recommend 的 LLMProfile。文案生成，需要自然流畅"""
 
     # ── 数据库配置 ───────────────────────────────────────
 
@@ -98,3 +116,19 @@ class Settings(BaseSettings):
 
     max_consult_rounds: int = 6
     """问诊最大追问轮数。超过此轮数强制进入推荐，防止无休止追问"""
+
+    def get_profile(self, field_name: str) -> LLMProfile:
+        """从 Settings 的 dict 字段构建 LLMProfile 对象。
+
+        Args:
+            field_name: 字段名，如 "llm_dispatcher" / "llm_consult" / "llm_react" / "llm_recommend"
+
+        Returns:
+            对应的 LLMProfile 实例
+
+        Raises:
+            AttributeError: 字段名不存在
+            ValidationError: dict 内容不符合 LLMProfile schema
+        """
+        raw = getattr(self, field_name)
+        return LLMProfile(**raw)

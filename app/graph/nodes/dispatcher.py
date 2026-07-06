@@ -1,10 +1,14 @@
 """
-Dispatcher node — 对话路由分发控制器。
+Dispatcher node — 对话意图解析器（v2: 执行计划格式）。
 
-这是整个对话系统的"大脑"：每次用户发来消息，Dispatcher 分析对话上下文和用户意图，
-决定下一步应该走哪个节点（consult / explain / recommend / end）。
+每次用户发来消息，Dispatcher 分析对话上下文和用户意图，
+输出有序的执行计划 actions[]，告诉 Orchestrator 接下来要做什么。
 
-它不做任何业务逻辑，只做路由决策。由 LLM 驱动（调用通义千问）。
+从 v2 开始，Dispatcher 不再输出单一路由，而是输出执行计划：
+  - workflow: 症状求药主链路（consult → safety → recommend → inventory）
+  - react:    通用对话（药品查询、对比、闲聊等，由 ReactAgent 处理）
+
+它不做任何业务逻辑，只做意图解析。由 LLM 驱动（调用通义千问）。
 """
 
 import json
@@ -16,52 +20,61 @@ from app.graph.state import ConversationState, normalize_messages
 from app.llm.client import LLMClient
 
 
-class DispatcherDecision(BaseModel):
-    """LLM 输出的路由决策结构。
+class ActionItem(BaseModel):
+    """执行计划中的一个动作。"""
 
-    通过 generate_structured() 让 LLM 严格输出 JSON，解析为此模型。
-
-    Dispatcher 只负责对话方向分类，不判断信息充分性。
-    "recommend" 路由已移除——推荐永远是 consult→done 的自然结果。
-    """
-
-    route: str = Field(
-        description="目标节点: consult(症状相关) | explain(药品咨询) | end(结束)"
+    action: str = Field(
+        description="动作类型: 'workflow'（症状求药主链路） | 'react'（通用对话/药品咨询）"
     )
     intent: str = Field(
-        description="用户意图: describe_symptom | answer_question | provide_profile | "
-                    "want_recommend | switch_drug | switch_symptom | ask_drug | give_up | other"
+        description="意图分类。workflow: describe_symptom | answer_question | want_recommend | switch_drug；"
+                    "react: ask_drug | compare_drugs | ask_interaction | chat | give_up"
     )
-    params: dict = Field(
-        default_factory=dict,
-        description="附加参数，如 {drug_name: '布洛芬', reset_slots: true, filter_cheaper: true}"
+    query: str = Field(
+        default="",
+        description="react 动作时的用户核心问题。workflow 时可为空"
+    )
+    priority: int = Field(
+        default=1,
+        description="执行顺序，1=先执行。workflow 始终为 1，react 为 2"
+    )
+
+
+class DispatcherDecision(BaseModel):
+    """LLM 输出的执行计划。
+
+    包含 1-2 个有序动作。workflow 始终在 react 之前执行。
+    """
+
+    actions: list[ActionItem] = Field(
+        description="有序动作列表，长度 1-2。workflow（priority=1）在 react（priority=2）之前"
     )
 
 
 async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> dict:
-    """分析对话上下文 + 用户最新消息，决策路由和意图。
+    """分析对话上下文 + 用户最新消息，输出执行计划 actions[]。
 
-    Dispatcher 只负责对话方向分类（consult / explain / end），
-    不判断信息是否充分、不决定是否可以推荐。
-    推荐永远是 consult→done 的自然结果。
+    Dispatcher 只负责意图解析，不判断信息是否充分、不决定是否可以推荐。
+    Workflow 由 Orchestrator 编排（consult → safety → recommend → inventory）,
+    React 由 ReactAgent 工具驱动处理。
 
     处理流程：
       1. 从 state.messages 中提取最新一条用户消息
-      2. 收集上下文：当前阶段、之前阶段、已收集的症状摘要
-      3. 调用 LLM（结构化输出）生成路由决策
-      4. 根据决策更新 previous_phase（记录跳转前的阶段）
+      2. 收集上下文：当前阶段、已收集的症状摘要、最近对话
+      3. 调用 LLM（结构化输出）生成执行计划
+      4. 输出 dispatcher_result = {actions: [...]}
 
     Args:
         state:      当前对话状态
         llm_client: LLM 客户端（注入）
 
     Returns:
-        state 更新 dict：dispatcher_result, previous_phase, phase, node_events
+        state 更新 dict：dispatcher_result, phase, node_events
     """
     # ── 1. 提取最新用户消息 ──
     messages = normalize_messages(state.get("messages", []))
     if not messages:
-        return _fallback_route()  # 无消息 → 默认走 consult
+        return _fallback_plan()
 
     latest_user = ""
     for m in reversed(messages):
@@ -70,12 +83,11 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
             break
 
     if not latest_user.strip():
-        return _fallback_route()  # 空消息 → 默认走 consult
+        return _fallback_plan()
 
     # ── 2. 收集 LLM 输入上下文 ──
     slots = state.get("consult_slots", {})
     current_phase = state.get("phase", "intake")
-    previous_phase = state.get("previous_phase")
 
     # 取最近 N 条对话历史作为上下文（帮助 LLM 理解对话进展）
     recent_n = 8  # 最近 4 轮对话
@@ -83,8 +95,7 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
 
     context = {
         "current_phase": current_phase,
-        "previous_phase": previous_phase,
-        "collected_slots_summary": _summarize_slots(slots),  # 人类可读的症状摘要
+        "collected_slots_summary": _summarize_slots(slots),
         "recent_conversation": _format_recent_messages(recent_messages),
         "user_message": latest_user,
     }
@@ -94,57 +105,49 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
     ]
 
-    # ── 3. 调用 LLM 获取路由决策 ──
+    # ── 3. 调用 LLM 获取执行计划 ──
     try:
         decision = await llm_client.generate_structured(
             messages=prompt_messages,
             schema=DispatcherDecision,
-            temperature=0.2,   # 低温度：路由决策需要稳定，不要创意
+            temperature=0.2,
             max_tokens=256,
         )
     except Exception:
-        # LLM 调用失败 → 默认走 consult（安全兜底）
-        return _fallback_route()
+        return _fallback_plan()
 
-    # ── 4. 处理 previous_phase 跳转逻辑 ──
-    new_previous_phase = previous_phase
-
-    # 如果在问诊/初始阶段跳去解释药品 → 记录当前阶段，以便解释完回到原来的流程
-    if decision.route == "explain" and current_phase in ("consulting", "intake"):
-        new_previous_phase = current_phase
-
-    # 如果用户放弃 → 清空 previous_phase（不再需要回到原来流程）
-    if decision.route == "end" and decision.intent == "give_up":
-        new_previous_phase = None
+    # ── 4. 构建 node_events ──
+    events = [{
+        "node": "dispatcher",
+        "actions": [
+            {"action": a.action, "intent": a.intent, "priority": a.priority}
+            for a in decision.actions
+        ],
+    }]
 
     return {
         "dispatcher_result": {
-            "route": decision.route,
-            "intent": decision.intent,
-            "params": decision.params,
+            "actions": [a.model_dump() for a in decision.actions],
         },
-        "previous_phase": new_previous_phase,
         "phase": current_phase,
-        "node_events": [{
-            "node": "dispatcher",
-            "route": decision.route,
-            "intent": decision.intent,
-        }],
+        "node_events": events,
     }
 
 
-def _fallback_route() -> dict:
-    """LLM 失败或无法判断时的默认路由 → consult。
+def _fallback_plan() -> dict:
+    """LLM 失败或无法判断时的默认执行计划 → 全部走 react（安全兜底）。
 
-    安全策略：不确定时宁可多走一轮 consult 提取信息，不要直接推荐。
+    安全策略：不确定时走 react，由 ReactAgent 通过工具查询信息。
     """
     return {
         "dispatcher_result": {
-            "route": "consult",
-            "intent": "fallback",
-            "params": {},
+            "actions": [
+                {"action": "react", "intent": "fallback", "query": "", "priority": 1}
+            ],
         },
-        "node_events": [{"node": "dispatcher", "route": "consult", "intent": "fallback"}],
+        "node_events": [
+            {"node": "dispatcher", "actions": [{"action": "react", "intent": "fallback"}]}
+        ],
     }
 
 

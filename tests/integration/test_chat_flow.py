@@ -71,21 +71,27 @@ async def test_graph_compiles():
     )
 
     assert graph is not None
-    # Graph should have nodes
+    # Graph nodes in v2: workflow 节点保留，explain → react
     nodes = graph.get_graph().nodes
     assert "intake" in nodes
     assert "dispatcher" in nodes
     assert "consult" in nodes
     assert "safety_block" in nodes
     assert "recommend" in nodes
-    assert "explain" in nodes
     assert "inventory" in nodes
+    assert "react" in nodes
     assert "end" in nodes
+    # explain 被 react 替代
+    assert "explain" not in nodes
 
 
 @pytest.mark.asyncio
 async def test_topic_switch_preserves_context():
-    """User switches to explain during consult → previous_phase recorded."""
+    """User asks about a drug during consult → dispatcher outputs react action.
+
+    In v2, the dispatcher outputs actions[] and the orchestrator handles
+    the transition. Context is preserved through state, not previous_phase.
+    """
     state = initial_state(
         session_id="test-switch",
         messages=[{"role": "user", "content": "布洛芬有什么副作用？"}],
@@ -102,7 +108,7 @@ async def test_topic_switch_preserves_context():
         "allergies": [],
     }
 
-    # The dispatcher node should set previous_phase to "consulting"
-    # so the system can return after explain.
-    # This is tested in test_dispatcher.py
+    # In v2, the dispatcher would output actions: [{action: "react", ...}]
+    # The orchestrator handles context preservation internally
     assert state["phase"] == "consulting"
+    assert state["consult_slots"]["symptoms"][0]["name"] == "头痛"

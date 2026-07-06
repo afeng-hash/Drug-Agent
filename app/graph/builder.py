@@ -1,38 +1,44 @@
 """
-Graph builder — 组装 LangGraph 状态机。
+Graph builder — 组装 LangGraph 状态机（v2）。
 
-这是整个系统的"大脑骨架"——定义节点、边、条件路由，把所有组件串联起来。
+图结构：
+  intake → dispatcher ──→ consult ──→ safety ──→ recommend → inventory ──→ react → end
+                    │        │          │                       │
+                    │        │(ask)     │(BLOCK)                │(no react)
+                    │        ├── react  └── end                 └── end
+                    │        └── end
+                    │
+                    └── react → end
 
-流程图：
-  intake ──▶ dispatcher ──▶ consult ──▶ safety_block ──▶ recommend ──▶ inventory ──▶ end
-                 │    │         │            │
-                 │    │  (ask)→ end        (BLOCK)→ end
-                 │    │
-                 │    ├── explain ──▶ end
-                 │    └── end
-
-关键设计：recommend 永远是 consult→done 的自然结果，dispatcher 不能直达 recommend。
+explain 节点被 react 替代——ReactAgent 工具驱动处理所有泛咨询。
+consult / safety / recommend / inventory 保持为独立图节点（不变）。
 """
 
 from functools import partial
 
 from langgraph.graph import END, StateGraph
 
+from app.agent.prompts import REACT_SYSTEM_PROMPT
+from app.agent.react.agent import ReactAgent
+from app.agent.react.schemas import ToolDefinition
+from app.agent.react.tools import ToolRegistry
 from app.graph.nodes.consult import consult_node
 from app.graph.nodes.dispatcher import dispatcher_node
 from app.graph.nodes.end import end_node
-from app.graph.nodes.explain import explain_node
 from app.graph.nodes.intake import intake_node
 from app.graph.nodes.inventory import inventory_node
+from app.graph.nodes.react import react_node
 from app.graph.nodes.recommend import recommend_node
 from app.graph.nodes.safety_check import safety_block_node
 from app.graph.router import (
     route_after_consult,
     route_after_dispatcher,
+    route_after_inventory,
     route_after_safety,
 )
 from app.graph.state import ConversationState
 from app.llm.client import LLMClient
+from app.llm.profile import LLMProfile
 from app.rag.retriever import DrugManualRetriever
 from app.rules.engine import RuleEngine
 from app.scorer.pipeline import ScoringPipeline
@@ -50,208 +56,354 @@ def build_graph(
     scoring_pipeline: ScoringPipeline,
     drug_graph_repo=None,
     vocab_source=None,
+    react_profile: LLMProfile | None = None,
     max_consult_rounds: int = 6,
 ) -> StateGraph:
     """构建并编译 LangGraph 状态机。
 
-    在 FastAPI lifespan 的 startup 阶段调用一次。
-    返回的 compiled graph 挂到 app.state.graph 上，每次请求时复用。
-
     Args:
-        llm_client:          LLM 客户端（通义千问）
-        rule_engine:         安全规则引擎（已注册所有规则）
-        drug_repo_factory:   药品仓库工厂（每次调用创建新 DB 会话）
+        llm_client:           LLM 客户端
+        rule_engine:          安全规则引擎
+        drug_repo_factory:    药品仓库工厂
         inventory_repo_factory: 库存仓库工厂
-        session_repo_factory:   会话仓库工厂
+        session_repo_factory: 会话仓库工厂
         safety_log_repo_factory: 安全日志仓库工厂
-        retriever:           Milvus 药品说明书检索器
-        max_consult_rounds:  问诊最多追问轮数，超过此数强制进入推荐
+        weight_repo_factory:  权重配置仓库工厂
+        retriever:            Milvus 药品说明书检索器
+        scoring_pipeline:     评分排序管线
+        drug_graph_repo:      Neo4j 图谱仓库（可选）
+        vocab_source:         症状词表（可选）
+        react_profile:        ReactAgent 的 LLMProfile
+        max_consult_rounds:   问诊最大追问轮数
 
     Returns:
-        编译好的 LangGraph 图（可直接调用 .astream_events()）
+        编译好的 LangGraph 图
     """
     graph = StateGraph(ConversationState)
 
     # ── 添加节点 ──────────────────────────────────────────
-    # 每个节点是一个 async 函数，接收 state，返回部分更新的 dict
-    # 用 partial 把不可序列化的依赖（LLM client 等）通过闭包注入
 
     graph.add_node("intake", intake_node)
-    """预处理节点：更新 phase，不做复杂逻辑"""
 
     graph.add_node("dispatcher", partial(dispatcher_node, llm_client=llm_client))
-    """路由分发节点：LLM 分析用户意图，决定下一步走哪个节点"""
 
     graph.add_node(
         "consult",
         partial(consult_node, llm_client=llm_client, max_rounds=max_consult_rounds),
     )
-    """症状问诊节点：多轮追问，收集症状槽位"""
 
     graph.add_node(
         "safety_block",
         partial(safety_block_node, rule_engine=rule_engine),
     )
-    """安全拦截节点：仅症状级 BLOCK（高烧/婴儿/孕妇/紧急），不含药品级禁忌"""
 
-    # recommend / explain / inventory / end 需要每次新开 DB 会话，
-    # 所以用工厂模式（_make_* 闭包），而不是直接传 repo 实例
     graph.add_node(
         "recommend",
-        _make_recommend(llm_client, drug_repo_factory, weight_repo_factory, retriever, scoring_pipeline, drug_graph_repo, vocab_source),
+        _make_recommend(
+            llm_client, drug_repo_factory, weight_repo_factory,
+            retriever, scoring_pipeline, drug_graph_repo, vocab_source,
+        ),
     )
-    """药品推荐节点：ScoringPipeline 排序 + RAG 说明书 + LLM 文案"""
-
-    graph.add_node(
-        "explain",
-        _make_explain(llm_client, drug_repo_factory, retriever),
-    )
-    """药品解释节点：DB + RAG → 格式化的药品说明书"""
 
     graph.add_node(
         "inventory",
         _make_inventory(inventory_repo_factory, drug_repo_factory),
     )
-    """库存节点：查询推荐药品的库存和价格"""
+
+    graph.add_node(
+        "react",
+        _make_react(
+            llm_client, drug_repo_factory, retriever, react_profile,
+        ),
+    )
 
     graph.add_node(
         "end",
         _make_end(session_repo_factory, safety_log_repo_factory),
     )
-    """结束节点：持久化消息、记录安全日志"""
 
     # ── 添加边 ──────────────────────────────────────────
 
-    # 入口 → intake
     graph.set_entry_point("intake")
-
-    # intake → dispatcher（无条件）
     graph.add_edge("intake", "dispatcher")
 
-    # dispatcher → 3 路条件分支
-    # （recommend 路由已移除——推荐永远是 consult→done 的自然结果）
+    # dispatcher → consult / react
     graph.add_conditional_edges(
         "dispatcher",
-        route_after_dispatcher,           # 条件函数：读 dispatcher_result.route
+        route_after_dispatcher,
         {
-            "consult": "consult",          # 症状相关（描述、回答、个人信息、推荐意愿、换药）
-            "explain": "explain",          # 药品咨询
-            "end": "end",                  # 结束
+            "consult": "consult",
+            "react": "react",
         },
     )
 
-    # consult → 2 路条件分支
+    # consult → safety_block / react / end
     graph.add_conditional_edges(
         "consult",
-        route_after_consult,              # 条件函数：读 consult_next_action
+        route_after_consult,
         {
-            "safety_block": "safety_block",  # done → 进入安全拦截
-            "end": "end",                    # ask → 等待用户下一轮输入
+            "safety_block": "safety_block",
+            "react": "react",
+            "end": "end",
         },
     )
 
-    # safety_block → 2 路条件分支
+    # safety_block → recommend / end
     graph.add_conditional_edges(
         "safety_block",
-        route_after_safety,               # 条件函数：读 safety_result.verdict
+        route_after_safety,
         {
-            "recommend": "recommend",      # PASS → 继续推荐
-            "end": "end",                  # BLOCK → 终止，返回警告
+            "recommend": "recommend",
+            "end": "end",
         },
     )
 
-    # 推荐链（线性）：recommend → inventory → end
+    # recommend → inventory（无条件的线性链）
     graph.add_edge("recommend", "inventory")
-    graph.add_edge("inventory", "end")
 
-    # explain → end（解释完就结束本轮）
-    graph.add_edge("explain", "end")
+    # inventory → react / end
+    graph.add_conditional_edges(
+        "inventory",
+        route_after_inventory,
+        {
+            "react": "react",
+            "end": "end",
+        },
+    )
 
-    # end → 图结束（触发 .astream_events() 停止）
+    # react → end
+    graph.add_edge("react", "end")
+
+    # end → END
     graph.add_edge("end", END)
 
-    # ── 编译 ──
     return graph.compile()
 
 
-# ──────────────────────────────────────────────────────────
-# 节点工厂函数（闭包注入 DB 仓库）
-#
-# 为什么需要工厂？
-#   LangGraph 的节点函数签名是 (state) → dict。但 recommend/explain/
-#   inventory/end 节点需要 DB session。如果直接把 repo 传给节点，
-#   repo 绑定的 session 会在整个应用生命周期内一直存在（连接池泄露）。
-#
-#   factory 模式：每次节点被调用时，通过工厂函数新开一个 DB 会话，
-#   用完即关。这样每个 Graph run 都有独立的短生命周期 DB session。
-# ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# 节点工厂
+# ═══════════════════════════════════════════════════════════
 
 
-def _make_recommend(llm_client, drug_repo_factory, weight_repo_factory, retriever, scoring_pipeline, drug_graph_repo=None, vocab_source=None):
-    """创建 recommend 节点的闭包。
+class _StateProxy:
+    """工具 get_recommendation / get_user_profile 的 state 代理。
 
-    调用时机：每次 Graph 运行到 recommend 节点时。
-    内部逻辑：Neo4j 图查询药品 → ScoringPipeline 排序 → RAG 查说明书 → LLM 写推荐文案 → 返回推荐。
+    graph build 时创建，每次 react_node 调用前由 react_node 更新。
     """
+
+    def __init__(self):
+        self.recommendations: list[dict] = []
+        self.user_profile: dict = {}
+
+
+def _make_react(
+    llm_client: LLMClient,
+    drug_repo_factory,
+    retriever: DrugManualRetriever,
+    react_profile: LLMProfile | None = None,
+):
+    """创建 react 节点的闭包。
+
+    工厂内完成：
+      1. ToolRegistry + 5 个工具注册
+      2. ReactAgent 实例化
+      3. react_node 的 partial 绑定
+    """
+    state_proxy = _StateProxy()
+    registry = ToolRegistry()
+
+    # 工具 1: search_drug
+    registry.register(
+        ToolDefinition(
+            name="search_drug",
+            description="搜索药品。根据药品名称（通用名/商品名/拼音）模糊搜索，返回匹配的药品列表。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "药品名称关键词"},
+                    "limit": {"type": "integer", "description": "返回数量上限，默认 5"},
+                },
+                "required": ["query"],
+            },
+        ),
+        _make_search_drug(drug_repo_factory),
+    )
+
+    # 工具 2: get_drug_detail
+    registry.register(
+        ToolDefinition(
+            name="get_drug_detail",
+            description="获取药品完整信息：适应症、用法用量、不良反应、禁忌、相互作用等。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "drug_name": {"type": "string", "description": "药品通用名"},
+                },
+                "required": ["drug_name"],
+            },
+        ),
+        _make_get_drug_detail(drug_repo_factory, retriever),
+    )
+
+    # 工具 3: search_manual
+    registry.register(
+        ToolDefinition(
+            name="search_manual",
+            description="在药品说明书中检索与用户问题相关的片段。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "drug_name": {"type": "string", "description": "药品名称"},
+                    "question": {"type": "string", "description": "用户关心的问题"},
+                    "top_k": {"type": "integer", "description": "返回片段数量，默认 5"},
+                },
+                "required": ["drug_name", "question"],
+            },
+        ),
+        _make_search_manual(retriever),
+    )
+
+    # 工具 4: get_recommendation
+    registry.register(
+        ToolDefinition(
+            name="get_recommendation",
+            description="获取系统当前已推荐的药品列表。用于解析'这个药'等指代。",
+            parameters={"type": "object", "properties": {}},
+        ),
+        _make_get_recommendation(state_proxy),
+    )
+
+    # 工具 5: get_user_profile
+    registry.register(
+        ToolDefinition(
+            name="get_user_profile",
+            description="获取用户个人信息（年龄、过敏史、慢性病、特殊人群等）。用于个性化回答。",
+            parameters={"type": "object", "properties": {}},
+        ),
+        _make_get_user_profile(state_proxy),
+    )
+
+    react_agent = ReactAgent(
+        llm_client=llm_client,
+        system_prompt=REACT_SYSTEM_PROMPT,
+        tool_registry=registry,
+        profile=react_profile,
+        max_iterations=5,
+    )
+
     async def wrapped(state: ConversationState) -> dict:
-        async with drug_repo_factory() as drug_repo, weight_repo_factory() as weight_repo:
-            return await recommend_node(
-                state,
-                llm_client=llm_client,
-                drug_repo=drug_repo,
-                weight_repo=weight_repo,
-                retriever=retriever,
-                scoring_pipeline=scoring_pipeline,
-                drug_graph_repo=drug_graph_repo,
-                vocab_source=vocab_source,
-            )
+        return await react_node(
+            state=state,
+            react_agent=react_agent,
+            state_proxy=state_proxy,
+        )
+
     return wrapped
 
 
-def _make_explain(llm_client, drug_repo_factory, retriever):
-    """创建 explain 节点的闭包。
-
-    调用时机：Dispatcher 判定用户在问某个药品时。
-    内部逻辑：DB 查药品基本信息 + Milvus 向量检索说明书 → LLM 格式化解释。
-    """
+def _make_recommend(llm_client, drug_repo_factory, weight_repo_factory,
+                    retriever, scoring_pipeline, drug_graph_repo=None, vocab_source=None):
     async def wrapped(state: ConversationState) -> dict:
-        async with drug_repo_factory() as drug_repo:
-            return await explain_node(
-                state,
-                llm_client=llm_client,
-                drug_repo=drug_repo,
-                retriever=retriever,
+        async with drug_repo_factory() as drug_repo, weight_repo_factory() as weight_repo:
+            return await recommend_node(
+                state, llm_client=llm_client, drug_repo=drug_repo,
+                weight_repo=weight_repo, retriever=retriever,
+                scoring_pipeline=scoring_pipeline,
+                drug_graph_repo=drug_graph_repo, vocab_source=vocab_source,
             )
     return wrapped
 
 
 def _make_inventory(inventory_repo_factory, drug_repo_factory):
-    """创建 inventory 节点的闭包。
-
-    调用时机：recommend 节点之后。
-    内部逻辑：根据推荐药品的 drug_id 查库存表 → 格式化库存信息 → 追加到 response。
-    """
     async def wrapped(state: ConversationState) -> dict:
         async with inventory_repo_factory() as inv_repo, drug_repo_factory() as drug_repo:
-            return await inventory_node(
-                state,
-                inventory_repo=inv_repo,
-                drug_repo=drug_repo,
-            )
+            return await inventory_node(state, inventory_repo=inv_repo, drug_repo=drug_repo)
     return wrapped
 
 
 def _make_end(session_repo_factory, safety_log_repo_factory):
-    """创建 end 节点的闭包。
-
-    调用时机：每个 turn 的最后一步。
-    内部逻辑：保存 AI 回复到 messages 表 + 记录安全日志到 safety_logs 表。
-    """
     async def wrapped(state: ConversationState) -> dict:
         async with session_repo_factory() as session_repo, safety_log_repo_factory() as safety_log_repo:
-            return await end_node(
-                state,
-                session_repo=session_repo,
-                safety_log_repo=safety_log_repo,
-            )
+            return await end_node(state, session_repo=session_repo, safety_log_repo=safety_log_repo)
     return wrapped
+
+
+# ═══════════════════════════════════════════════════════════
+# 工具 Executor 工厂
+# ═══════════════════════════════════════════════════════════
+
+def _make_search_drug(drug_repo_factory):
+    async def execute(query: str, limit: int = 5):
+        async with drug_repo_factory() as repo:
+            results = await repo.search(query, limit=limit)
+            return [
+                {
+                    "drug_id": getattr(r, "drug_id", r.get("drug_id", "")),
+                    "generic_name": getattr(r, "generic_name", r.get("generic_name", "")),
+                    "trade_names": getattr(r, "trade_names", r.get("trade_names", "")),
+                }
+                for r in results
+            ]
+    return execute
+
+
+def _make_get_drug_detail(drug_repo_factory, retriever):
+    async def execute(drug_name: str):
+        async with drug_repo_factory() as repo:
+            drug = await repo.get_by_name(drug_name)
+            if not drug:
+                return {"error": f"未找到药品：{drug_name}"}
+            drug_dict = drug if isinstance(drug, dict) else {
+                "drug_id": getattr(drug, "drug_id", None),
+                "generic_name": getattr(drug, "generic_name", drug_name),
+                "trade_names": getattr(drug, "trade_names", ""),
+                "category": getattr(drug, "category", ""),
+                "indications": getattr(drug, "indications", ""),
+                "usage_dosage": getattr(drug, "usage_dosage", ""),
+                "adverse_reactions": getattr(drug, "adverse_reactions", ""),
+                "contraindications": getattr(drug, "contraindications", ""),
+                "interactions": getattr(drug, "interactions", ""),
+                "precautions": getattr(drug, "precautions", ""),
+            }
+            if retriever:
+                try:
+                    chunks = await retriever.retrieve_multi(
+                        drug_name, question="适应症 不良反应 禁忌 用法用量", top_k=5
+                    )
+                    drug_dict["manual_chunks"] = [
+                        c.content if hasattr(c, "content") else str(c) for c in chunks
+                    ]
+                except Exception:
+                    pass
+            return drug_dict
+    return execute
+
+
+def _make_search_manual(retriever):
+    async def execute(drug_name: str, question: str, top_k: int = 5):
+        if not retriever:
+            return {"error": "说明书检索服务不可用"}
+        try:
+            chunks = await retriever.retrieve_multi(drug_name, question=question, top_k=top_k)
+            return [
+                {
+                    "content": c.content if hasattr(c, "content") else str(c),
+                    "source": getattr(c, "source", "") if hasattr(c, "source") else "",
+                }
+                for c in chunks
+            ]
+        except Exception as e:
+            return {"error": f"检索失败：{str(e)}"}
+    return execute
+
+
+def _make_get_recommendation(state_proxy: _StateProxy):
+    async def execute():
+        return list(state_proxy.recommendations)
+    return execute
+
+
+def _make_get_user_profile(state_proxy: _StateProxy):
+    async def execute():
+        return dict(state_proxy.user_profile)
+    return execute

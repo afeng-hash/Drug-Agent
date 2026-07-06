@@ -73,25 +73,25 @@ class ConversationState(TypedDict):
     可选值：
       - "intake"       ← 初始状态，用户刚发来消息
       - "consulting"   ← 正在多轮症状追问中
+      - "reacting"     ← ReactAgent 正在处理药品咨询/闲聊
       - "recommending" ← 已完成推荐
-      - "explaining"   ← 正在解释某个药品
       - "ended"        ← 本轮处理结束
 
     用途：
-      - Dispatcher 根据当前 phase 决定路由逻辑（如 consulting 阶段问药 → explain）
+      - Dispatcher 根据当前 phase 决定意图解析策略
       - End 节点会把它写入 message 的 metadata
       - SSE 事件不会直接用这个字段，而是用 node_events
     """
 
     previous_phase: str | None
-    """【上一个阶段】记录跳转到 Explain 之前的阶段。
+    """【上一个阶段】记录跳转到新阶段之前的阶段。
 
-    用途：用户在当前对话中突然问某个药品（如"布洛芬怎么吃"），Dispatcher 路由到
-    Explain 节点，此时记录之前是什么阶段。Explain 结束后可能回到之前的 flow。
+    用途：预留字段，用于未来需要阶段恢复的场景。当前 v2 架构中
+          由 Orchestrator 编排所有流程，不再需要条件跳转恢复。
 
     为 None 的情况：
       - 还没发生跨阶段跳转
-      - 用户说"算了/去医院"，Dispatcher 清空它
+      - 用户说"算了/去医院"（正常结束）
     """
 
     # ────────────────────────────────────────────
@@ -99,31 +99,29 @@ class ConversationState(TypedDict):
     # ────────────────────────────────────────────
 
     dispatcher_result: dict[str, Any]
-    """【Dispatcher 输出】LLM 分析用户意图后返回的路由决策。
+    """【Dispatcher 输出】LLM 分析用户意图后返回的执行计划（v2）。
 
-    Dispatcher 只负责对话方向分类，不判断信息充分性。
-    "recommend" 路由已移除——推荐永远是 consult→done 的自然结果。
+    Dispatcher 只负责意图解析，不判断信息充分性。
+    输出为有序动作列表 actions[]，由 Orchestrator 按优先级顺序执行。
 
     结构：
       {
-        "route": "consult" | "explain" | "end",
-          # 目标节点：
-          #   consult   → 症状相关（描述症状/回答追问/个人信息/推荐意愿/换药）
-          #   explain   → 药品解释（询问某个具体药品）
-          #   end       → 结束（闲聊/感谢/放弃）
-        "intent": "describe_symptom" | "answer_question" | "provide_profile" |
-                  "want_recommend" | "switch_drug" | "switch_symptom" |
-                  "ask_drug" | "give_up" | "other",
-          # 细分的用户意图，传递给 Consult Agent 影响追问策略
-        "params": {
-          "drug_name": "布洛芬",              # ← intent=ask_drug 时，提取的药品名
-          "reset_slots": true,                # ← intent=switch_symptom 时，清空旧症状
-          "filter_cheaper": true,             # ← intent=switch_drug 时，要求便宜的
-        }
+        "actions": [
+          {"action": "workflow", "intent": "describe_symptom", "priority": 1},
+            # action 类型：
+            #   workflow  → 症状求药主链路（consult → safety → recommend → inventory）
+            #   react     → 通用对话（药品查询/对比/闲聊/放弃，由 ReactAgent 处理）
+            # intent 分类：
+            #   workflow: describe_symptom | answer_question | want_recommend | switch_drug
+            #   react:    ask_drug | compare_drugs | ask_interaction | chat | give_up
+            # priority: 1=先执行(workflow), 2=后执行(react)
+          {"action": "react", "intent": "ask_drug", "query": "布洛芬有什么作用", "priority": 2}
+            # query: react action 时的核心问题文本。workflow 时可为空
+        ]
       }
 
     来源：Dispatcher 节点（LLM 调用）
-    消费：router.py 的 route_after_dispatcher()，以及 consult/explain 节点
+    消费：Orchestrator 节点（按 actions 顺序编排 workflow 和 react）
     """
 
     # ────────────────────────────────────────────
@@ -172,7 +170,7 @@ class ConversationState(TypedDict):
       - "done" ← 信息充分，进入 safety_block → recommend → inventory 链路
 
     来源：Consult Agent
-    消费：route_after_consult() 决定走 safety_block 还是 end
+    消费：Orchestrator 根据 next_action 决定走 safety_block 还是结束
     """
 
     consult_rounds: int
@@ -221,7 +219,7 @@ class ConversationState(TypedDict):
 
     来源：safety_block 节点（调用 RuleEngine.check()）
     消费：
-      - router.py 的 route_after_safety() 根据 verdict 决定路由
+      - Orchestrator 根据 verdict 决定是否继续推荐
       - End 节点写入 safety_logs 表做审计
       - SSE 通过 "safety" 事件推送给前端
 
