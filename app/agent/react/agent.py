@@ -292,14 +292,12 @@ class ReactAgent:
 
             tool_results.append(result)
 
-            # 将 tool result 追加到 messages（OpenAI tool role 格式）
+            # 包装工具结果（空结果标记 + 异常处理）
+            wrapped = _wrap_tool_result(result)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": json.dumps(
-                    result.data if result.success else {"error": result.error},
-                    ensure_ascii=False,
-                ),
+                "content": json.dumps(wrapped, ensure_ascii=False),
             })
 
         return AgentStep(
@@ -331,34 +329,35 @@ class ReactAgent:
             return self._format_raw_result(str(e))
 
     def _format_raw_result(self, error_info: str = "") -> str:
-        """LLM 完全不可用时，把工具原始数据拼成降级回复。
+        """LLM 完全不可用时的降级回复。
 
-        这是 explain._fallback_explain() 降级逻辑的迁移版本。
+        有工具缓存数据时输出结构化摘要；无数据时做纯服务不可用提示。
         """
         findings = self.memory.snapshot()["intermediate_findings"]
         if not findings:
             return (
                 "抱歉，当前服务暂时不可用，无法完成您的查询。"
-                "建议您咨询医生或药师获取准确信息。"
+                "建议您查看药品纸质说明书，或咨询医生/药师获取准确信息。"
             )
 
-        # 把工具数据格式化为可读文本
         parts: list[str] = []
         for tool_name, data in findings.items():
             if isinstance(data, list):
                 items = []
-                for item in data[:3]:  # 最多 3 条
+                for item in data[:3]:
                     if isinstance(item, dict):
-                        items.append(item.get("name", str(item)))
+                        label = item.get("generic_name") or item.get("name") or item.get("title") or str(item)
+                        items.append(label)
                     else:
                         items.append(str(item))
                 parts.append(f"- {tool_name}: {', '.join(items)}")
             elif isinstance(data, dict):
-                parts.append(f"- {tool_name}: {data.get('name', str(data))}")
+                label = data.get("generic_name") or data.get("name") or str(data)
+                parts.append(f"- {tool_name}: {label}")
             elif isinstance(data, str):
                 parts.append(f"- {tool_name}: {data}")
 
-        findings_text = "\n".join(parts) if parts else "暂无详细信息"
+        findings_text = "\n".join(parts) if parts else "暂无"
 
         return _FALLBACK_TEMPLATE.format(findings=findings_text)
 
@@ -419,3 +418,46 @@ def _safe_json_parse(raw: str | dict) -> dict:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return {}
+
+
+def _wrap_tool_result(result: ToolResult) -> dict:
+    """包装工具结果为 LLM 友好格式。
+
+    处理三种情况：
+      1. 成功 + 非空数据 → 原样返回
+      2. 成功 + 空数据（[]/{}) → 包装为 {"found": false, ...}
+      3. 失败 → 返回 {"error": ...}
+    """
+    if not result.success:
+        return {"error": result.error or "工具执行失败"}
+
+    data = result.data
+
+    # 空列表
+    if isinstance(data, list) and len(data) == 0:
+        return {
+            "found": False,
+            "results": [],
+            "message": "本地知识库未找到相关信息。请尝试其他工具或联网搜索。",
+        }
+
+    # 空字典
+    if isinstance(data, dict) and len(data) == 0:
+        return {
+            "found": False,
+            "message": "未找到相关信息。",
+        }
+
+    # 字典中明确标记 empty
+    if isinstance(data, dict) and data.get("empty") is True:
+        return {
+            "found": False,
+            "message": data.get("message", "未找到相关信息。"),
+        }
+
+    # 正常数据（如果 dict 没有 found 字段，添加 found: true）
+    if isinstance(data, dict) and "found" not in data:
+        data = dict(data)
+        data["found"] = True
+
+    return data

@@ -30,13 +30,15 @@ async def react_node(
 
     Args:
         state:        当前对话状态
-        react_agent:  ReactAgent 实例（已注册 5 个工具）
+        react_agent:  ReactAgent 实例（已注册 6 个工具）
         state_proxy:  _StateProxy 实例，从中读取 recommendations/user_profile 给工具
 
     Returns:
         state 更新 dict：response, phase, node_events
     """
-    messages = state.get("messages", [])
+    # ── 0. 统一 normalize messages（F1 修复：只 normalize 一次） ──
+    raw_messages = state.get("messages", [])
+    messages = normalize_messages(raw_messages)
 
     # ── 1. 获取 react query ──
     actions = state.get("dispatcher_result", {}).get("actions", [])
@@ -45,26 +47,41 @@ async def react_node(
     if react_actions:
         query = react_actions[0].get("query", "")
 
-    # 没有显式 query → 取最后一条用户消息
+    # 没有显式 query → 取最后一条用户消息（已 normalize，顺序正确）
     if not query:
-        #todo 消息顺序乱了
-        normalized = normalize_messages(messages)
-        for m in reversed(normalized):
+        for m in reversed(messages):
             if m.get("role") == "user":
                 query = m.get("content", "")
                 break
 
-    # ── 2. 构建 workflow 上下文（供 ReactAgent 做智能衔接） ──
-    workflow_context = None
-    workflow_response = state.get("response", "")
+    # ── 2. 构建 workflow 上下文（F2 修复：基于 phase + recommendations 判断） ──
     recommendations = state.get("recommendations", [])
     consult_next_action = state.get("consult_next_action", "")
+    current_phase = state.get("phase", "")
 
-    #todo 此时是workflow问完了，然后用户又问了上面药哪些孕妇不能用
-    # todo 但是此时 consult_next_action 状态为 ask，workflow_response为 ''，recommendations有信息
+    # 判定 workflow 真实完成状态
+    if recommendations and current_phase in ("recommending", "ended"):
+        workflow_action = "done"
+    elif consult_next_action == "ask" and current_phase == "consulting":
+        workflow_action = "ask"
+    elif recommendations:
+        # 有推荐结果但 phase 不是 recommending——可能是新 turn，按 done 处理
+        workflow_action = "done"
+    else:
+        workflow_action = "ask"
+
+    # 构造 workflow_response：若 response 为空但有 recommendations，自动生成摘要
+    workflow_response = state.get("response", "")
+    if not workflow_response and recommendations:
+        drug_names = [
+            r.get("generic_name", "") for r in recommendations[:3]
+        ]
+        workflow_response = f"系统已推荐：{'、'.join(drug_names)}"
+
+    workflow_context = None
     if workflow_response or recommendations:
         workflow_context = {
-            "workflow_action": "done" if consult_next_action == "done" else "ask",
+            "workflow_action": workflow_action,
             "workflow_response": workflow_response,
         }
 
@@ -79,7 +96,7 @@ async def react_node(
             "special_population": slots.get("special_population"),
         }
 
-    # ── 4. 执行 ReactAgent ──
+    # ── 4. 执行 ReactAgent（传入已 normalize 的 messages，F1 修复） ──
     result = await react_agent.run(
         user_message=query,
         history=messages,
@@ -87,7 +104,6 @@ async def react_node(
     )
 
     # ── 5. 组装最终回复 ──
-    # 如果有 workflow 先产生的回复，拼接在一起
     previous_response = state.get("response", "")
     if previous_response:
         final_response = f"{previous_response}\n\n{result.final_response}"
@@ -95,7 +111,7 @@ async def react_node(
         final_response = result.final_response
 
     # ── 6. 判断 phase ──
-    if consult_next_action == "ask":
+    if workflow_action == "ask" and current_phase == "consulting":
         phase = "consulting"
     elif state.get("phase") == "consulting":
         phase = "consulting"

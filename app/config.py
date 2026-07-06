@@ -117,6 +117,20 @@ class Settings(BaseSettings):
     max_consult_rounds: int = 6
     """问诊最大追问轮数。超过此轮数强制进入推荐，防止无休止追问"""
 
+    # ── 联网搜索配置 ─────────────────────────────────────
+
+    web_search_enabled: bool = True
+    """是否启用联网搜索。False 时 search_web 工具直接返回不可用"""
+
+    tavily_api_key: str = ""
+    """Tavily Search API Key。在 .env 中设置，形如 TAVILY_API_KEY=tvly-xxx"""
+
+    web_search_timeout: float = 10.0
+    """联网搜索单次请求超时（秒）"""
+
+    web_search_max_results: int = 5
+    """联网搜索最大返回结果数"""
+
     def get_profile(self, field_name: str) -> LLMProfile:
         """从 Settings 的 dict 字段构建 LLMProfile 对象。
 

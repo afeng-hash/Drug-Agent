@@ -11,6 +11,7 @@ ReactAgent 工具包。
   - drug_discovery:  search_drug（药品发现）
   - drug_profile:    get_drug_detail（完整档案，DB）
   - drug_qa:         search_manual（药品问答，Milvus）
+  - web_search:      search_web（联网搜索兜底，Bing）
   - state_access:    get_recommendation, get_user_profile（状态读取）
 """
 
@@ -21,6 +22,7 @@ from app.agent.react.tools.get_user_profile import GetUserProfileTool
 from app.agent.react.tools.registry import ToolRegistry
 from app.agent.react.tools.search_drug import SearchDrugTool
 from app.agent.react.tools.search_manual import SearchManualTool
+from app.agent.react.tools.search_web import SearchWebTool
 
 __all__ = [
     "BaseTool",
@@ -28,6 +30,7 @@ __all__ = [
     "SearchDrugTool",
     "GetDrugDetailTool",
     "SearchManualTool",
+    "SearchWebTool",
     "GetRecommendationTool",
     "GetUserProfileTool",
 ]

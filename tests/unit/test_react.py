@@ -292,3 +292,97 @@ async def test_react_node_no_query_uses_last_message():
     mock_agent.run.assert_called_once()
     # 验证 query 被正确提取
     assert mock_agent.run.call_args.kwargs["user_message"] == "你好"
+
+
+# ═══════════════════════════════════════════════════════════
+# F1 + F2 regression tests
+# ═══════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_react_node_workflow_done_with_empty_response():
+    """F2: response 为空但有 recommendations → workflow_context 为 done。"""
+    state = {
+        "session_id": "test",
+        "messages": [{"role": "user", "content": "这些药哪个孕妇不能用"}],
+        "phase": "ended",
+        "dispatcher_result": {
+            "actions": [
+                {"action": "react", "intent": "ask_drug",
+                 "query": "这些药哪个孕妇不能用", "priority": 1},
+            ],
+        },
+        "consult_slots": {"symptoms": [{"name": "咳嗽"}]},
+        "consult_next_action": "ask",
+        "recommendations": [
+            {"drug_id": 1, "generic_name": "布洛芬"},
+            {"drug_id": 2, "generic_name": "对乙酰氨基酚"},
+        ],
+        "response": "",
+    }
+
+    mock_agent = MagicMock()
+    mock_agent.run = AsyncMock(return_value=AgentResult(
+        final_response="对乙酰氨基酚相对安全，布洛芬孕早期慎用。",
+        steps=[],
+        total_iterations=1,
+        total_time_ms=500.0,
+    ))
+
+    result = await react_node(state, mock_agent)
+
+    # workflow_context 应正确判定为 done
+    call_kwargs = mock_agent.run.call_args.kwargs
+    assert call_kwargs["context"] is not None
+    assert call_kwargs["context"]["workflow_action"] == "done"
+    # 即使 response 为空，workflow_response 应从 recommendations 生成
+    assert "布洛芬" in call_kwargs["context"]["workflow_response"]
+    assert result["phase"] == "ended"
+
+
+@pytest.mark.asyncio
+async def test_react_node_message_order():
+    """F1: react_node 传给 react_agent 的是已 normalize 的消息。"""
+    state = {
+        "session_id": "test",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "第一轮提问"},
+            {"role": "assistant", "content": "第一轮回答"},
+            {"role": "user", "content": "布洛芬是什么"},
+        ],
+        "phase": "intake",
+        "dispatcher_result": {
+            "actions": [
+                {"action": "react", "intent": "ask_drug",
+                 "query": "布洛芬是什么", "priority": 1},
+            ],
+        },
+        "consult_slots": {},
+        "consult_next_action": "",
+        "recommendations": [],
+        "response": "",
+    }
+
+    mock_agent = MagicMock()
+    mock_agent.run = AsyncMock(return_value=AgentResult(
+        final_response="布洛芬是一种解热镇痛药。",
+        steps=[],
+        total_iterations=1,
+        total_time_ms=300.0,
+    ))
+
+    await react_node(state, mock_agent)
+
+    call_kwargs = mock_agent.run.call_args.kwargs
+    # 传入的 history 应该是 normalized 的 dict 列表
+    history = call_kwargs["history"]
+    assert isinstance(history, list)
+    assert len(history) >= 4
+    # 每条消息都应有 role 和 content 字段
+    for msg in history:
+        assert "role" in msg
+        assert "content" in msg
+    # 最后一条应该是最后一条 user 消息（不是 system 消息）
+    user_msgs = [m for m in history if m["role"] == "user"]
+    assert user_msgs[-1]["content"] == "布洛芬是什么"

@@ -1,234 +1,212 @@
-# PR Summary：Dispatcher v2 执行计划 + ReactAgent 替代 Explain 节点
+# PR Summary：ReactAgent v2.1 — 三级数据源策略 + 防编造护栏 + Bug 修复
 
 **Branch**: `master`  
-**Files**: 11 files changed | **Diff**: `+780 / -502`  
-**Key**: `app/graph/nodes/explain.py` — **deleted** (138 lines)
+**Files**: 7 modified + 3 new (untracked) | **Diff**: `+246 / -32` (tracked) + new files  
+**Key**: `app/search/` — 新增联网搜索模块；`search_web` 成为第 6 个工具
 
 ---
 
 ## 一、概述
 
-本次变更是架构 v2 升级的第二步（第一步 `f49cdca` 已完成 Dispatcher 职责收窄）：
+本次变更是 ReactAgent 的 v2.1 完善升级，聚焦三个目标：
 
-1. **Dispatcher 从「单路由」升级为「执行计划」** — 支持混合意图，一次输出 1~2 个有序动作
-2. **ReactAgent（工具驱动的 ReAct 循环）替代旧 Explain 节点** — 药品查询从模板化解释升级为多工具协同的智能回复
-3. **LLM 多 Profile 支持** — 每个业务节点使用独立的模型配置（而非共用一个全局 model）
-
-```
-旧图：
-  intake → dispatcher → {consult, explain, end}
-  consult → {safety_block, end}
-  safety_block → {recommend, end}
-  recommend → inventory → end
-  explain → end
-
-新图：
-  intake → dispatcher → {consult, react}
-  consult → {safety_block, react, end}
-  safety_block → {recommend, end}
-  recommend → inventory → {react, end}
-  react → end
-```
-
-核心变化：explain 节点被 react 替代；react 成为所有路径的汇聚点。
+1. **三级数据源策略** — 本地 DB → 本地 Milvus RAG → Tavily 联网搜索，逐级兜底
+2. **防编造护栏** — 空结果标记机制 + Prompt 约束，杜绝 LLM 凭记忆编造药品信息
+3. **两个 Bug 修复** — F1（消息重复 normalize 导致顺序错乱）+ F2（workflow 上下文误判）
 
 ---
 
 ## 二、逐文件变更
 
-### 1. `app/agent/prompts.py` (+192/-86) — Dispatcher Prompt 重写 + 新增 ReactAgent Prompt
+### 1. `app/search/` — **新模块**：联网搜索服务（3 文件）
 
-**Dispatcher Prompt 升级为 v2**：
-
-- 名称从"对话方向识别器"升级为"对话意图解析器（v2: 执行计划格式）"
-- 输出从 `{route, intent, params}` 变为 `{actions: [{action, intent, query, priority}]}`
-- 路由分类从 3 路（consult/explain/end）变为 2 种动作类型（workflow/react）
-- 新增加编排规则（6 条）、2 种意图分类（workflow + react 各有独立意图集）
-- 新增 6 个详细示例（纯症状、纯药品、混合意图、闲聊、回答追问+药品、换药）
-- 移除 `previous_phase` 输入字段（Dispatcher 不再维护此概念）
-
-**新增 REACT_SYSTEM_PROMPT**（~35 行）：
-- 定义 ReactAgent 的能力边界（查药、对比、相互作用、解析指代、闲聊）
-- 工具使用规则（并行调用、继续探索、通俗解释）
-- 权限约束（只读、不处方、仅供参考）
-- "这个药"指代处理指南
-
-### 2. `app/graph/nodes/dispatcher.py` (+127/-138) — 执行计划格式
-
-**Schema 变更**：
-
-```python
-# 旧
-class DispatcherDecision:
-    route: str    # "consult" | "explain" | "end"
-    intent: str   # 9 种意图
-    params: dict  # {drug_name, reset_slots, ...}
-
-# 新
-class ActionItem:
-    action: str    # "workflow" | "react"
-    intent: str    # 按 action 类型分流
-    query: str     # react 动作的核心问题
-    priority: int  # 1=先执行
-
-class DispatcherDecision:
-    actions: list[ActionItem]  # 1~2 个有序动作
+```
+app/search/
+├── __init__.py      # 导出 WebSearchService, TavilySearchService, WebSearchResult, WebSearchResponse
+├── schemas.py       # WebSearchResult（title/snippet/url/source） + WebSearchResponse
+└── service.py       # WebSearchService (ABC) + TavilySearchService (httpx 实现)
 ```
 
-**关键变化**：
-- `previous_phase` 跳转逻辑完全移除（v2 不再需要）
-- `node_events` 从 `{route, intent}` 变为 `{actions: [{action, intent, priority}]}`
-- `dispatcher_result` 从 `{route, intent, params}` 变为 `{actions: [...]}`
-- 降级策略：从"默认走 consult"变为"默认走 react"（安全兜底）
+**设计**：`WebSearchService` 是抽象基类，`TavilySearchService` 是默认实现。未来可替换为 Bing/Google 等后端，只需实现 `search()` 和 `is_available`。
 
-### 3. `app/graph/nodes/explain.py` — **已删除**（-138 lines）
+**Tavily 实现细节**：
+- API: `https://api.tavily.com/search`
+- `search_depth=basic` — 快速搜索模式
+- 超时 + HTTP 异常全量兜底（不抛异常，返回 `WebSearchResponse` 含 `warning` 字段）
+- API Key 为空时 `is_available=False`，SearchWebTool 直接返回不可用
 
-旧的 explain 节点被 ReactAgent 完全替代。旧节点只能：DB 查药 → Milvus RAG → LLM 模板输出。新 ReactAgent 可以：多工具并行调用、药品对比、指代解析、上下文衔接。
+### 2. `app/agent/react/tools/search_web.py` — **新文件**：SearchWebTool
 
-### 4. `app/graph/builder.py` (+396/-208) — 图结构重构 + ReactAgent 工厂
+```python
+class SearchWebTool(BaseTool):
+    capabilities = ["web_search"]
+    fallback_tools = []        # 最后一级，无替代工具
+```
 
-**核心变化**：
+- 能力标签 `web_search`（供 LLM 按场景选择）
+- 输入 `query` + 可选 `num_results`
+- 返回结构化 dict：`found`, `results[]`（每条含 `title/snippet/url/source="web"`）, `warning`
+- `@property definition` 描述明确标注"仅在本地工具返回空或不充分时使用"
 
-| 维度 | 旧 | 新 |
-|------|----|----|
-| explain 节点 | 存在 | **删除** |
-| react 节点 | 不存在 | **新增**（汇聚点） |
-| dispatcher 分支 | 3 路（consult/explain/end） | 2 路（consult/react） |
-| consult 分支 | 2 路（safety_block/end） | 3 路（safety_block/react/end） |
-| inventory 分支 | 直接→end | 条件分支（react/end） |
+### 3. `app/config.py` (+14) — 联网搜索配置
 
-**新增类 `_StateProxy`**：可变的 state 代理，ReactAgent 的 `get_recommendation` / `get_user_profile` 工具通过它读取 state 数据，react_node 每次调用前更新。
+```python
+web_search_enabled: bool = True             # 全局开关
+tavily_api_key: str = ""                    # Tavily API Key（.env: TAVILY_API_KEY=tvly-xxx）
+web_search_timeout: float = 10.0            # 请求超时（秒）
+web_search_max_results: int = 5             # 每次搜最多返回结果数
+```
 
-**新增 `_make_react()` 工厂**：注册 5 个工具 → 实例化 ReactAgent → 绑定 react_node。
+### 4. `app/agent/react/agent.py` (+68/-10) — 空结果包装 + 降级增强
 
-**新增 6 个工具 Executor 工厂**（`_make_search_drug`, `_make_get_drug_detail`, `_make_search_manual`, `_make_get_recommendation`, `_make_get_user_profile`），每个工厂返回闭包 executor，内部自行管理 DB session 生命周期。
+**新增 `_wrap_tool_result()` 函数**（~35 行）：
 
-### 5. `app/graph/router.py` (+88/-57) — 基于 actions[] 的路由
+处理三种情况：
+| 工具返回 | 包装结果 | 语义 |
+|---------|---------|------|
+| 成功 + `[]` 或 `{}` | `{"found": false, "message": "本地知识库未找到..."}` | 空结果 → 触发 LLM 找替代工具 |
+| 成功 + `{"empty": true}` | `{"found": false, "message": "..."}` | 显式空标记（如服务不可用） |
+| 成功 + 非空数据 | 保持原样 + 补充 `found: true`（若无） | 正常数据 |
 
-所有路由函数从读取 `dispatcher_result.route` 改为读取 `dispatcher_result.actions[]`：
+**`_handle_tool_calls()` 变更**：工具结果不再直接 `json.dumps(result.data)`，改为 `_wrap_tool_result(result)` 处理后再序列化。
 
-| 函数 | 逻辑 |
+**`_format_raw_result()` 增强**：降级回复的信息展示从 `item.get("name")` 改为 `item.get("generic_name") or item.get("name") or item.get("title")`，兼容三种数据格式。
+
+### 5. `app/agent/prompts.py` (+43/-3) — Prompt 防编造 + 三级策略规则
+
+**REACT_SYSTEM_PROMPT 增强**（~40 行新增）：
+
+| 规则 | 内容 |
 |------|------|
-| `route_after_dispatcher` | 有 workflow action → "consult"；纯 react → "react" |
-| `route_after_consult` | done → "safety_block"；ask + 有 react → "react"；ask → "end" |
-| `route_after_safety` | 不变 |
-| `route_after_inventory` | **新增** — 有 react → "react"；无 → "end" |
+| 严禁编造 | 新增禁止使用"基于国家药监局公开信息""根据临床常规""据我所知"等措辞 |
+| 空结果行为 | 4 步强制流程：不编造 → 换工具 → 联网搜索兜底 → 全部失败时标准拒绝话术 |
+| 联网搜索规则 | 5 条：确认前置条件、query 格式、来源 URL、网络数据专区、免责声明 |
+| 来源标注规则 | 本地数据正常回答；有网络数据则分「📋 本地知识库」「🌐 网络补充」两个区域 |
+| 工具表更新 | 新增 `search_web` 行：本地工具均返回空或不充分时使用 |
+| 拒绝话术 | 若没有能回答的信息则拒绝回答，建议咨询人工/专业医生 |
 
-新增 `_get_actions()` 辅助函数。
+**CONSULT_PROMPT 微调**：response 风格要求从"不要太机械"扩展为"专业、清晰、自然，不要机械重复用户问题"。
 
-### 6. `app/llm/client.py` (+139/-65) — 多 Profile + generate_with_tools
+### 6. `app/graph/nodes/react.py` (+44/-14) — 两个 Bug 修复
 
-**多 Profile 支持**：所有 4 个方法（`generate`, `generate_structured`, `generate_with_tools`, `stream`）新增 `profile: LLMProfile | None` 参数。未传入时使用 `self.default_profile`（向后兼容）。
-
-**新增 `generate_with_tools()`**：单次 LLM 调用，返回原始响应对象（含可能的 tool_calls）。专供 ReactAgent 的 ReAct 循环使用——每次只做一次请求，循环逻辑由 ReactAgent 控制。
-
-**实现细节**：
-- `self.model` → `self.default_profile = LLMProfile(model=settings.llm_model)`
-- temperature/max_tokens 从 `float`/`int` 变为 `Optional[...]`，None 时取 profile 默认值
-- `generate_structured()` 的 JSON 模式和 tool-call 回退两种路径都使用 profile
-
-### 7. `app/config.py` (+34) — 多 Profile 配置
-
+**F1 — 消息 normalize 修复**：
 ```python
-llm_dispatcher: dict = {"model": "qwen-turbo", "temperature": 0.1, "max_tokens": 256}
-llm_consult: dict    = {"model": "qwen-plus",  "temperature": 0.3, "max_tokens": 1024}
-llm_react: dict      = {"model": "qwen-plus",  "temperature": 0.3, "max_tokens": 1024}
-llm_recommend: dict  = {"model": "qwen-plus",  "temperature": 0.3, "max_tokens": 512}
+# 旧（bug）：messages 被 react_agent._build_messages() 内部 normalize 一次，
+#          react_node 自己又 normalize 一次 → 消息顺序可能错乱
+normalized = normalize_messages(messages)
+
+# 新（fix）：在 react_node 入口统一 normalize 一次，后面全部使用
+raw_messages = state.get("messages", [])
+messages = normalize_messages(raw_messages)
 ```
 
-新增 `get_profile(field_name)` 方法，从 dict 构建 `LLMProfile` 对象。支持通过环境变量覆盖（如 `LLM_DISPATCHER='{"model":"qwen-turbo","temperature":0}'`）。
+**F2 — workflow 上下文判定修复**：
+```python
+# 旧（bug）：只看 consult_next_action，忽略 phase 和 recommendations 状态
+workflow_action = "done" if consult_next_action == "done" else "ask"
 
-### 8. `app/graph/state.py` (+50/-42) — 注释和文档更新
+# 新（fix）：综合判定（phase + recommendations + consult_next_action）
+if recommendations and current_phase in ("recommending", "ended"):
+    workflow_action = "done"
+elif consult_next_action == "ask" and current_phase == "consulting":
+    workflow_action = "ask"
+elif recommendations:
+    workflow_action = "done"    # 有推荐但 phase 异常 → 按 done 兜底
+```
 
-- Phase 枚举：`explaining` → `reacting`
-- `previous_phase` 注释重写为"预留字段"
-- `dispatcher_result` 注释从 route 格式完全重写为 actions[] 格式
-- 各字段的"消费"标注从具体文件改为架构角色（如"Orchestrator"）
+**workflow_response 回填**：当 `response` 为空但有 recommendations 时，自动生成摘要：
+```python
+if not workflow_response and recommendations:
+    drug_names = [r.get("generic_name", "") for r in recommendations[:3]]
+    workflow_response = f"系统已推荐：{'、'.join(drug_names)}"
+```
 
-### 9. `app/graph/nodes/consult.py` (+1) — 注释标记
+**phase 判定修复**：`workflow_action == "ask"` 且 `current_phase == "consulting"` 才设 `phase=consulting`，避免误判。
 
-添加 `#todo` 标记（重构提示）。
+### 7. `app/graph/builder.py` (+4) — 第 6 个工具注册
 
-### 10. 测试文件
+```python
+web_search_service = TavilySearchService(Settings())
+tools: list[BaseTool] = [
+    SearchDrugTool(...),
+    GetDrugDetailTool(...),
+    SearchManualTool(...),
+    SearchWebTool(web_search_service=web_search_service),  # 新增
+    GetRecommendationTool(...),
+    GetUserProfileTool(...),
+]
+```
 
-- `tests/unit/test_dispatcher.py` (+99/-56)：所有测试用例从 route 格式迁移到 actions[] 格式；新增 `test_dispatcher_mixed_intent`（混合意图测试）；fallback 断言更新
-- `tests/integration/test_chat_flow.py` (+18/-12)：节点清单从 explain→react；topic_switch 测试注释更新
+### 8. `app/agent/react/tools/__init__.py` (+2) — 导出更新
+
+新增 `SearchWebTool` 到 `__all__`。
+
+### 9. `tests/unit/test_react.py` (+94) — 回归测试
+
+新增 2 个 Bug 修复回归测试 + 1 个 workflow 上下文测试：
+- `test_react_node_workflow_done_with_empty_response` — F2：空 response 但有 recommendations 时 workflow_context 为 done
+- `test_react_node_message_order` — F1：传入 react_agent 的消息是已 normalize 的 dict，role 统一
+
+### 10. `tests/unit/test_search_web.py` — **新文件**（150 行）
+
+- `TestSearchWebTool`：4 个用例（正常返回、空结果、source 标记、fallback_tools 检查）
+- `TestEmptyResultWrapping`：6 个用例（空列表、空字典、非空保留、found 补全、error 透传、empty 标记保持）
+- 1 个 Prompt 回归测试（search_web 在 REACT_SYSTEM_PROMPT 中）
 
 ---
 
 ## 三、核心架构决策
 
-### 决策 1：Dispatcher 输出执行计划而非单一路由
+### 决策 1：三级数据源漏斗
 
-**旧问题**：用户说"咳嗽吃什么药，布洛芬有什么作用"——Dispatcher 只能选一条路（consult 或 explain），另一条信息被丢弃。
+```
+用户问题
+  → 第 1 级: search_drug / get_drug_detail（PostgreSQL）
+     ↓ 空？
+  → 第 2 级: search_manual（Milvus RAG 向量检索）
+     ↓ 空？
+  → 第 3 级: search_web（Tavily 联网搜索）
+     ↓ 空？
+  → 标准拒绝话术："建议咨询医生/药师"
+```
 
-**新方案**：Dispatcher 输出 `[{workflow, priority=1}, {react, priority=2}]`，Orchestrator 按优先级顺序执行。Workflow 先跑（consult→recommend→inventory），然后 react 拿推荐结果做药品解释。
+三级之间通过 `_wrap_tool_result()` 的 `found: false` 标记串联——LLM 看到 `found=false` 后按 Prompt 规则自动尝试下一级。
 
-### 决策 2：ReactAgent 替代 Explain 节点
+### 决策 2：空结果标记机制
 
-| 维度 | 旧 Explain | 新 ReactAgent |
-|------|-----------|---------------|
-| 数据来源 | DB + RAG（单药） | DB + RAG + State（多药/对比） |
-| 交互模式 | 单次 LLM 调用 | ReAct 多轮工具循环 |
-| 药品对比 | 不支持 | 支持（并行调用两个 get_drug_detail） |
-| "这个药"指代 | 依赖 dispatcher 提取 drug_name | 通过 get_recommendation 工具自动解析 |
-| 上下文衔接 | 无 | 感知 workflow 状态，自然过渡 |
-| 并行工具调用 | 不支持 | 支持（同一轮调用多个工具） |
+**问题**：工具返回 `[]` 时 LLM 可能理解为"没有找到"但也可能理解为"工具调用出错"或"不需要展示"。
 
-### 决策 3：多 Profile 分离模型配置
+**方案**：`_wrap_tool_result()` 在所有空结果上显式添加 `{"found": false, "message": "..."}` 标记，让 LLM 明确知道"此数据源无数据"，从而触发 Prompt 定义的备用工具流程。
 
-Dispatcher 用快速模型（qwen-turbo, temperature=0.1），Consult/React 用准确模型（qwen-plus, temperature=0.3）。未来可独立调节每个节点的模型而互不影响。
+### 决策 3：Tavily 而非直接调 Bing API
+
+Tavily 专为 AI Agent 设计，返回的 content 字段是提取干净的文本（非 HTML），适合 LLM 直接消费。同时 `httpx` 异步调用 + 全异常兜底，不影响主流程稳定性。
+
+### 决策 4：WebSearchService 抽象
+
+```python
+class WebSearchService(ABC):
+    async def search(query, num_results) -> WebSearchResponse: ...
+    def is_available(self) -> bool: ...
+```
+
+未来切换到 Bing/Gemini/SerpAPI 只需实现这个接口，替换 `TavilySearchService(Settings())` 即可。
 
 ---
 
 ## 四、Breaking Changes
 
-### BC-1：`dispatcher_result` 结构完全变更
+### BC-1：工具数量从 5 变 6
 
-```python
-# 旧格式
-state["dispatcher_result"] = {"route": "consult", "intent": "describe_symptom", "params": {}}
+`react_agent.tool_registry` 从 5 工具变为 6 工具。如果有代码硬编码了工具数量 `==5` 的断言，需要更新为 `>=6`。
 
-# 新格式
-state["dispatcher_result"] = {
-    "actions": [
-        {"action": "workflow", "intent": "describe_symptom", "priority": 1}
-    ]
-}
-```
+### BC-2：`_handle_tool_calls()` 的工具结果格式变更
 
-**影响范围**：
-- 所有消费 `dispatcher_result` 的代码（router.py、consult_node、react_node、chat.py SSE 事件）
-- 所有测试用例
-- 数据库 session 的 `state_snapshot` 字段中存储的历史 dispatcher_result
+工具结果从直接序列化变为 `_wrap_tool_result()` 包装后序列化——LLM 看到的 tool message content 现在包含 `found`、`message`、`source` 等新增字段。
 
-### BC-2：`explain` 节点已删除
+### BC-3：需要 Tavily API Key
 
-旧 API 中依赖 explain 节点的任何路径（如旧版 Dispatcher 的 route="explain"）不再存在。所有药品查询统一走 ReactAgent。
-
-### BC-3：LLMClient 构造签名变更
-
-```python
-# 旧
-self.model = settings.llm_model
-
-# 新
-self.default_profile = LLMProfile(model=settings.llm_model)
-```
-
-`self.model` 属性不再存在。直接访问 `client.model` 的代码会报 AttributeError。
-
-### BC-4：generate* 方法的 temperature/max_tokens 类型变更
-
-```python
-# 旧
-generate(messages, temperature: float = 0.3, max_tokens: int = 1024)
-
-# 新
-generate(messages, temperature: float | None = None, max_tokens: int | None = None, profile=None)
-```
-
-如果外部代码用位置参数传递 temperature/max_tokens，行为不变。但如果依赖"不传参数时默认为 0.3/1024"的语义，现在默认值来自 profile。
+生产环境需在 `.env` 配置 `TAVILY_API_KEY=tvly-xxx`。开发环境可设置 `web_search_enabled=false` 跳过。
 
 ---
 
@@ -236,11 +214,12 @@ generate(messages, temperature: float | None = None, max_tokens: int | None = No
 
 | 维度 | 影响 |
 |------|------|
-| **药品查询能力** | 从单药模板解释升级为多工具协同（查药+详情+说明书+推荐列表+用户画像） |
-| **混合意图处理** | 用户"咳嗽吃什么药，顺便问布洛芬副作用"——两个意图都被正确执行 |
-| **模型资源优化** | Dispatcher 用轻量模型（省钱+快），Consult/React 用准确模型 |
-| **"这个药"指代** | ReactAgent 通过 get_recommendation 工具自动解析，不再依赖上游提取 drug_name |
-| **代码复杂度** | explain 节点删除（-138 lines），ReactAgent 以工具注册方式扩展功能 |
-| **可配置性** | 每个节点的 model/temperature/max_tokens 可通过环境变量独立覆盖 |
+| **防编造能力** | 三级门禁（空标记 + Prompt 禁止 + 拒绝话术），LLM 无法用"据我所知"绕过工具查询 |
+| **数据覆盖** | 本地知识库（DB + Milvus）覆盖不到的药品信息，自动联网搜索兜底 |
+| **用户透明度** | 网络数据明确标注来源 URL + 免责声明，用户可区分本地和网络来源 |
+| **消息处理** | F1 修复后 normalize 只做一次，消息顺序正确，不再出现 system 消息被当 user 的 bug |
+| **workflow 衔接** | F2 修复后 ReactAgent 正确感知 workflow 完成状态，推荐后的追问能准确引用推荐结果 |
+| **开发环境** | `web_search_enabled=false` 可完全关闭联网搜索，不依赖外部 API |
+| **扩展性** | WebSearchService ABC 设计支持任意搜索后端替换 |
 
 ---

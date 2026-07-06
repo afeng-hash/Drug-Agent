@@ -27,7 +27,10 @@ from app.agent.react.tools.get_recommendation import GetRecommendationTool
 from app.agent.react.tools.get_user_profile import GetUserProfileTool
 from app.agent.react.tools.search_drug import SearchDrugTool
 from app.agent.react.tools.search_manual import SearchManualTool
+from app.agent.react.tools.search_web import SearchWebTool
+from app.config import Settings
 from app.graph.nodes.consult import consult_node
+from app.search.service import TavilySearchService
 from app.graph.nodes.dispatcher import dispatcher_node
 from app.graph.nodes.end import end_node
 from app.graph.nodes.intake import intake_node
@@ -214,12 +217,17 @@ def _make_react(
     """
     state_proxy = _StateProxy()
 
+    # ── 联网搜索服务（Tavily） ──
+    web_search_service = TavilySearchService(Settings())
+
     # ── 工具列表（加新工具 = 加一行） ──
     tools: list[BaseTool] = [
-        # 药品信息类
+        # 药品信息类（本地）
         SearchDrugTool(drug_repo_factory=drug_repo_factory),
         GetDrugDetailTool(drug_repo_factory=drug_repo_factory),
         SearchManualTool(retriever=retriever),
+        # 联网搜索兜底
+        SearchWebTool(web_search_service=web_search_service),
         # 状态读取类
         GetRecommendationTool(state_proxy=state_proxy),
         GetUserProfileTool(state_proxy=state_proxy),
