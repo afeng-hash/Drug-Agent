@@ -125,6 +125,7 @@ class ReactAgent:
                     messages=messages,
                     tools=tool_defs,
                     profile=self.profile,
+                    node="react",
                 )
 
                 choice = response.choices[0]
@@ -321,6 +322,7 @@ class ReactAgent:
                 messages=messages,
                 tools=[],  # 不带工具，强制 LLM 只做文本回复
                 profile=self.profile,
+                node="react",
             )
             content = response.choices[0].message.content
             return content or "抱歉，我无法完成这次查询。请稍后再试。"

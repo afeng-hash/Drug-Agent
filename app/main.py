@@ -19,6 +19,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.routes.admin import admin_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.health import router as health_router
 from app.api.routes.session import router as session_router
@@ -136,6 +137,13 @@ async def lifespan(app: FastAPI):
     )
     app.state.graph = graph
 
+    # ── 注册 Admin Hook Registry（统一钩子入口）──
+    #   - 注册回调到 HookRegistry
+    #   - 桥接 registry → LLMClient._log_callback（LLM 调用日志）
+    #   - 桥接 registry → end_node._keyword_check_callback（高风险关键字检测）
+    from app.api.routes.admin.hook_registry import register_admin_hooks
+    register_admin_hooks()
+
     yield  # ══════════ 应用运行中 ══════════
 
     # ═══════════════════════════════════════════════
@@ -163,10 +171,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Admin 审计日志中间件（自动记录所有 admin 写操作）──
+from app.api.routes.admin.audit import AuditLogMiddleware
+app.add_middleware(AuditLogMiddleware)
+
 # ── 注册路由 ──
 app.include_router(health_router)     # GET /health
 app.include_router(session_router)    # POST /api/v1/sessions, GET /api/v1/sessions/{id}
 app.include_router(chat_router)       # POST /api/v1/chat/{id} (SSE)
+app.include_router(admin_router)      # /api/v1/admin/* (AI Agent 运营平台)
 
 
 # ──────────────────────────────────────────────────────────

@@ -137,6 +137,7 @@ async def run_consult(
         schema=ConsultResult,
         temperature=0.3,
         max_tokens=1024,
+        node="consult",
     )
 
     # ── 合并槽位 ──

@@ -112,6 +112,7 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
             schema=DispatcherDecision,
             temperature=0.2,
             max_tokens=256,
+            node="dispatcher",
         )
     except Exception:
         return _fallback_plan()

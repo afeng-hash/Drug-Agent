@@ -485,6 +485,7 @@ async def _generate_recommend_response(
             ],
             temperature=0.4,
             max_tokens=2048,
+            node="recommend",
         )
         content = result["choices"][0]["message"]["content"]
         return content + DISCLAIMER

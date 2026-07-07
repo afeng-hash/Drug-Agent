@@ -293,6 +293,7 @@ class SymptomNormalizer:
                 schema=SymptomMappingResult,
                 temperature=0.0,
                 max_tokens=512,
+                node="classifier",
             )
 
             for mapping in output.mappings:

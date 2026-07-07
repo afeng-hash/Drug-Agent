@@ -11,9 +11,17 @@ LLM Client — OpenAI-compatible protocol 封装。
 
 从 v2 开始，每个方法都接受可选的 LLMProfile 参数，实现按场景分离模型配置。
 配置来源：app.config.Settings（llm_base_url, llm_api_key, llm_model, embedding_model）
+
+日志采集：
+  - LLMClient._log_callback 可由 admin 模块设置，实现 fire-and-forget 写入 llm_call_logs
+  - 每个 generate 方法接受可选的 node 参数，标识调用节点（dispatcher/consult/react/...）
 """
 
+import asyncio
 import json
+import time as time_module
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, TYPE_CHECKING, Type, TypeVar
 
 from openai import AsyncOpenAI
@@ -27,6 +35,20 @@ if TYPE_CHECKING:
 T = TypeVar("T", bound=BaseModel)
 
 
+@dataclass
+class LLMCallLogData:
+    """传给 _log_callback 的 LLM 调用日志数据。"""
+    node: str
+    model: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    latency_ms: float = 0.0
+    success: bool = True
+    error_message: str | None = None
+    session_id: str | None = None
+    turn_id: str | None = None
+
+
 class LLMClient:
     """统一的 LLM 客户端，基于 OpenAI-compatible 协议。
 
@@ -38,7 +60,50 @@ class LLMClient:
         # 按场景使用不同 Profile
         profile = LLMProfile(model="qwen-turbo", temperature=0.1, max_tokens=256)
         result = await client.generate(messages, profile=profile)
+
+        # 启用日志采集
+        LLMClient.set_log_callback(my_async_callback)
     """
+
+    # ── 模块级日志回调 ──
+    _log_callback: Callable[[LLMCallLogData], Awaitable[None]] | None = None
+    """由 admin 模块设置的异步回调，fire-and-forget 写入 llm_call_logs。"""
+
+    @classmethod
+    def set_log_callback(
+        cls, callback: Callable[[LLMCallLogData], Awaitable[None]] | None,
+    ) -> None:
+        """设置日志回调（通常由 admin/__init__.py 在启动时调用）。"""
+        cls._log_callback = callback
+
+    def _schedule_log(self, data: LLMCallLogData) -> None:
+        """Fire-and-forget 写入日志，不阻塞主流程。
+
+        自动从 ContextVar 中补全 session_id / turn_id（若调用方未显式传入）。
+        若 ContextVar 未设置（罕见：executor 场景中协程上下文丢失），记录 warning。
+        """
+        import logging
+        _logger = logging.getLogger(__name__)
+        if data.session_id is None:
+            from app.llm.context import get_llm_session
+            data.session_id = get_llm_session()
+            if data.session_id is None:
+                _logger.warning(
+                    "_schedule_log: session_id ContextVar is None — "
+                    "LLM call log will not be linked to a session. "
+                    "This may happen if the coroutine context was lost (e.g., executor)."
+                )
+        if data.turn_id is None:
+            from app.llm.context import get_llm_turn
+            data.turn_id = get_llm_turn()
+            if data.turn_id is None:
+                _logger.warning(
+                    "_schedule_log: turn_id ContextVar is None — "
+                    "LLM call log will not be linked to a turn. "
+                    "This may happen if the coroutine context was lost."
+                )
+        if self._log_callback:
+            asyncio.create_task(self._log_callback(data))
 
     def __init__(self, settings: "Settings"):
         """初始化 LLM 客户端。
@@ -61,6 +126,8 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         profile: LLMProfile | None = None,
+        node: str | None = None,
+        session_id: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """调用 chat completions API，返回完整响应对象的 dict。
@@ -72,20 +139,46 @@ class LLMClient:
             temperature: 采样温度 0-2。None 时使用 profile 的默认值
             max_tokens:  最大输出 token 数。None 时使用 profile 的默认值
             profile:     场景配置。None 时使用 self.default_profile
+            node:        调用节点标识（dispatcher|consult|react|recommend|...）
+            session_id:  关联会话 UUID（可选）
 
         Returns:
             OpenAI API 响应的 model_dump()，结构：
             {"choices": [{"message": {"role": "assistant", "content": "..."}}], ...}
         """
         p = profile or self.default_profile
-        response = await self.client.chat.completions.create(
-            model=p.model,
-            messages=messages,
-            temperature=temperature if temperature is not None else p.temperature,
-            max_tokens=max_tokens if max_tokens is not None else p.max_tokens,
-            **kwargs,
-        )
-        return response.model_dump()
+        model = p.model
+        t0 = time_module.monotonic()
+        try:
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature if temperature is not None else p.temperature,
+                max_tokens=max_tokens if max_tokens is not None else p.max_tokens,
+                **kwargs,
+            )
+            result = response.model_dump()
+            usage = result.get("usage", {}) or {}
+            self._schedule_log(LLMCallLogData(
+                node=node or "unknown",
+                model=model,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                latency_ms=(time_module.monotonic() - t0) * 1000,
+                success=True,
+                session_id=session_id,
+            ))
+            return result
+        except Exception as exc:
+            self._schedule_log(LLMCallLogData(
+                node=node or "unknown",
+                model=model,
+                latency_ms=(time_module.monotonic() - t0) * 1000,
+                success=False,
+                error_message=str(exc),
+                session_id=session_id,
+            ))
+            raise
 
     async def generate_structured(
         self,
@@ -94,6 +187,8 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         profile: LLMProfile | None = None,
+        node: str | None = None,
+        session_id: str | None = None,
         **kwargs: Any,
     ) -> T:
         """调用 LLM 并解析为 Pydantic 结构化输出。
@@ -112,18 +207,22 @@ class LLMClient:
             temperature: 采样温度。None 时使用 profile 默认值
             max_tokens:  最大输出 token 数。None 时使用 profile 默认值
             profile:     场景配置。None 时使用 self.default_profile
+            node:        调用节点标识（dispatcher|consult|classifier|...）
+            session_id:  关联会话 UUID（可选）
 
         Returns:
             解析后的 Pydantic 模型实例
         """
         p = profile or self.default_profile
+        model = p.model
         temp = temperature if temperature is not None else p.temperature
         max_tok = max_tokens if max_tokens is not None else p.max_tokens
+        t0 = time_module.monotonic()
 
         try:
             # ── 方式 1：JSON 模式 ──
             response = await self.client.chat.completions.create(
-                model=p.model,
+                model=model,
                 messages=messages,
                 temperature=temp,
                 max_tokens=max_tok,
@@ -131,29 +230,70 @@ class LLMClient:
                 **kwargs,
             )
             raw = response.choices[0].message.content
+            usage = response.usage
+            self._schedule_log(LLMCallLogData(
+                node=node or "unknown",
+                model=model,
+                prompt_tokens=usage.prompt_tokens if usage else 0,
+                completion_tokens=usage.completion_tokens if usage else 0,
+                latency_ms=(time_module.monotonic() - t0) * 1000,
+                success=True,
+                session_id=session_id,
+            ))
             if raw is None:
                 raise ValueError("LLM returned empty response")
             data = json.loads(raw)
             return schema.model_validate(data)
 
-        except Exception:
+        except Exception as first_error:
             # ── 方式 2：Tool Calling 降级 ──
-            # 把 Pydantic schema 转成 tool 的 parameters
-            tool_name = schema.__name__
-            tool_schema = _pydantic_to_tool(schema, tool_name)
-
-            response = await self.client.chat.completions.create(
-                model=p.model,
-                messages=messages,
-                temperature=temp,
-                max_tokens=max_tok,
-                tools=[tool_schema],
-                tool_choice={"type": "function", "function": {"name": tool_name}},
-                **kwargs,
+            # 记录 JSON mode 失败（供运维监控）
+            import logging
+            _logger = logging.getLogger(__name__)
+            _logger.warning(
+                "generate_structured JSON mode failed for schema=%s model=%s "
+                "node=%s elapsed=%.0fms error=%s — falling back to tool calling",
+                schema.__name__, model, node or "unknown",
+                (time_module.monotonic() - t0) * 1000, first_error,
             )
-            tool_call = response.choices[0].message.tool_calls[0]
-            data = json.loads(tool_call.function.arguments)
-            return schema.model_validate(data)
+
+            try:
+                tool_name = schema.__name__
+                tool_schema = _pydantic_to_tool(schema, tool_name)
+
+                response = await self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temp,
+                    max_tokens=max_tok,
+                    tools=[tool_schema],
+                    tool_choice={"type": "function", "function": {"name": tool_name}},
+                    **kwargs,
+                )
+                tool_call = response.choices[0].message.tool_calls[0]
+                usage = response.usage
+                self._schedule_log(LLMCallLogData(
+                    node=node or "unknown",
+                    model=model,
+                    prompt_tokens=usage.prompt_tokens if usage else 0,
+                    completion_tokens=usage.completion_tokens if usage else 0,
+                    latency_ms=(time_module.monotonic() - t0) * 1000,  # 含 JSON mode 耗时
+                    success=True,
+                    session_id=session_id,
+                ))
+                data = json.loads(tool_call.function.arguments)
+                return schema.model_validate(data)
+
+            except Exception as second_error:
+                self._schedule_log(LLMCallLogData(
+                    node=node or "unknown",
+                    model=model,
+                    latency_ms=(time_module.monotonic() - t0) * 1000,
+                    success=False,
+                    error_message=str(second_error),
+                    session_id=session_id,
+                ))
+                raise
 
     async def generate_with_tools(
         self,
@@ -163,6 +303,8 @@ class LLMClient:
         max_tokens: int | None = None,
         profile: LLMProfile | None = None,
         tool_choice: str | dict | None = None,
+        node: str | None = None,
+        session_id: str | None = None,
         **kwargs: Any,
     ) -> Any:
         """单次 LLM 调用，返回可能包含 tool_calls 的原始响应。
@@ -177,17 +319,20 @@ class LLMClient:
             max_tokens:  最大输出 token 数。None 时使用 profile 默认值
             profile:     场景配置。None 时使用 self.default_profile
             tool_choice: 工具选择策略。"auto" / "none" / {"type":"function","function":{"name":"..."}}
+            node:        调用节点标识（react|...）
+            session_id:  关联会话 UUID（可选）
 
         Returns:
             原始 OpenAI chat.completions.create 响应对象（不解包）。
             调用方检查 response.choices[0].message.tool_calls 判断是否请求了工具调用。
         """
         p = profile or self.default_profile
+        model = p.model
         temp = temperature if temperature is not None else p.temperature
         max_tok = max_tokens if max_tokens is not None else p.max_tokens
 
         create_kwargs: dict[str, Any] = {
-            "model": p.model,
+            "model": model,
             "messages": messages,
             "temperature": temp,
             "max_tokens": max_tok,
@@ -197,7 +342,30 @@ class LLMClient:
         if tool_choice is not None:
             create_kwargs["tool_choice"] = tool_choice
 
-        return await self.client.chat.completions.create(**create_kwargs)
+        t0 = time_module.monotonic()
+        try:
+            response = await self.client.chat.completions.create(**create_kwargs)
+            usage = response.usage
+            self._schedule_log(LLMCallLogData(
+                node=node or "unknown",
+                model=model,
+                prompt_tokens=usage.prompt_tokens if usage else 0,
+                completion_tokens=usage.completion_tokens if usage else 0,
+                latency_ms=(time_module.monotonic() - t0) * 1000,
+                success=True,
+                session_id=session_id,
+            ))
+            return response
+        except Exception as exc:
+            self._schedule_log(LLMCallLogData(
+                node=node or "unknown",
+                model=model,
+                latency_ms=(time_module.monotonic() - t0) * 1000,
+                success=False,
+                error_message=str(exc),
+                session_id=session_id,
+            ))
+            raise
 
     async def stream(
         self,
@@ -205,6 +373,8 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         profile: LLMProfile | None = None,
+        node: str | None = None,
+        session_id: str | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
         """流式生成，逐 token 返回文本。
@@ -217,26 +387,58 @@ class LLMClient:
             temperature: 采样温度。None 时使用 profile 默认值
             max_tokens:  最大输出 token 数。None 时使用 profile 默认值
             profile:     场景配置。None 时使用 self.default_profile
+            node:        调用节点标识
+            session_id:  关联会话 UUID（可选）
 
         Yields:
             每个 token 的文本内容（str）
         """
         p = profile or self.default_profile
+        model = p.model
         temp = temperature if temperature is not None else p.temperature
         max_tok = max_tokens if max_tokens is not None else p.max_tokens
 
-        stream = await self.client.chat.completions.create(
-            model=p.model,
-            messages=messages,
-            temperature=temp,
-            max_tokens=max_tok,
-            stream=True,
-            **kwargs,
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta
-            if delta.content:
-                yield delta.content
+        t0 = time_module.monotonic()
+        prompt_tokens = 0
+        completion_tokens = 0
+        try:
+            stream = await self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temp,
+                max_tokens=max_tok,
+                stream=True,
+                stream_options={"include_usage": True},
+                **kwargs,
+            )
+            async for chunk in stream:
+                # 最后一个 chunk 通常包含 usage（取决于 provider 是否支持）
+                if hasattr(chunk, "usage") and chunk.usage:
+                    prompt_tokens = chunk.usage.prompt_tokens or 0
+                    completion_tokens = chunk.usage.completion_tokens or 0
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield delta.content
+
+            self._schedule_log(LLMCallLogData(
+                node=node or "unknown",
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=(time_module.monotonic() - t0) * 1000,
+                success=True,
+                session_id=session_id,
+            ))
+        except Exception as exc:
+            self._schedule_log(LLMCallLogData(
+                node=node or "unknown",
+                model=model,
+                latency_ms=(time_module.monotonic() - t0) * 1000,
+                success=False,
+                error_message=str(exc),
+                session_id=session_id,
+            ))
+            raise
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """生成文本的向量嵌入。
