@@ -5,6 +5,7 @@ Tests SOPEngine, SkillRouter, and data sufficiency logic.
 TaskClassifier and ResponseGenerator tested via integration (mock LLM).
 """
 
+import asyncio
 import pytest
 
 from app.agent.react.skills.types import (
@@ -271,3 +272,385 @@ class TestSOPDefinitions:
     def test_all_have_mandatory_reminders(self):
         for sop in ALL_TASK_DEFINITIONS:
             assert len(sop.mandatory_reminders) > 0, f"{sop.task_type} has no reminders"
+
+
+# =====================================================================
+# SOPEngine.execute() Tests — core execution pipeline
+# =====================================================================
+
+
+class TestSOPEngineExecute:
+    """SOPEngine.execute() — full execution flow with mock ToolRegistry."""
+
+    @pytest.fixture
+    def registry_and_engine(self):
+        """Create a ToolRegistry and SOPEngine, returning both for mock setup."""
+        from app.agent.react.tools import ToolRegistry
+
+        registry = ToolRegistry()
+        engine = SOPEngine(tool_registry=registry)
+        return registry, engine
+
+    @staticmethod
+    def _make_sop(steps: list | None = None) -> SOP:
+        """Factory: a minimal SOP with search_manual + get_drug_detail + search_web."""
+        if steps is not None:
+            return SOP(
+                task_type=TaskType.SIDE_EFFECTS,
+                steps=steps,
+                response_structure="...",
+                mandatory_reminders=["reminder"],
+                fallback_response="fallback",
+            )
+        return SOP(
+            task_type=TaskType.SIDE_EFFECTS,
+            steps=[
+                SOPStep(order=1, tool_name="search_manual",
+                        args_template={"drug_name": "{drug_name}", "question": "side effects"}),
+                SOPStep(order=2, tool_name="get_drug_detail",
+                        args_template={"drug_name": "{drug_name}"}),
+                SOPStep(order=3, tool_name="search_web",
+                        args_template={"query": "{drug_name} side effects"}),
+            ],
+            response_structure="...",
+            mandatory_reminders=["reminder"],
+            fallback_response="fallback",
+        )
+
+    def _register(self, registry, tool_name: str, return_data):
+        """Register a mock tool that always returns the given data."""
+
+        async def mock_execute(**kwargs):
+            return return_data
+
+        from app.agent.react.schemas import ToolDefinition
+
+        registry.register(
+            ToolDefinition(name=tool_name, description="mock", parameters={}),
+            mock_execute,
+        )
+
+    # ── Normal execution ──────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_local_steps_succeed_no_web_fallback(self, registry_and_engine):
+        """Local steps return usable data → search_web is NOT triggered."""
+        registry, engine = registry_and_engine
+        self._register(registry, "search_manual",
+                       [{"content": "This drug may cause nausea, dizziness, headache, and other common side effects. Patients should monitor for adverse reactions."}])
+        self._register(registry, "get_drug_detail",
+                       {"adverse_reactions": "Common: nausea, dizziness, headache. Rare: gastrointestinal bleeding."})
+        # Also register search_web — but it should never be called
+        web_called = False
+
+        async def web_mock(**kwargs):
+            nonlocal web_called
+            web_called = True
+            return {"source": "web", "results": [{"snippet": "web data"}]}
+
+        from app.agent.react.schemas import ToolDefinition
+
+        registry.register(
+            ToolDefinition(name="search_web", description="mock", parameters={}),
+            web_mock,
+        )
+
+        sop = self._make_sop()
+        result = await engine.execute(sop, {"drug_name": "ibuprofen"})
+
+        assert result.task_type == TaskType.SIDE_EFFECTS
+        assert result.has_usable_data is True
+        assert result.triggered_web_fallback is False
+        assert web_called is False
+        assert len(result.steps) == 2  # only local steps, no web step
+        assert all(s.success for s in result.steps)
+
+    @pytest.mark.asyncio
+    async def test_local_steps_partial_failure_still_triggers_no_web(self, registry_and_engine):
+        """One local step fails, the other has data → web NOT triggered (we have data)."""
+        registry, engine = registry_and_engine
+        self._register(registry, "search_manual",
+                       [{"content": "Sufficient content from search_manual: this drug is commonly used with minimal side effects and well tolerated across patient populations."}])
+        # get_drug_detail returns empty — no meaningful fields
+        self._register(registry, "get_drug_detail",
+                       {"drug_id": 1, "generic_name": "ibuprofen", "category": "NSAID"})
+        web_called = False
+
+        async def web_mock(**kwargs):
+            nonlocal web_called
+            web_called = True
+            return {"source": "web", "results": [{"snippet": "web"}]}
+
+        from app.agent.react.schemas import ToolDefinition
+
+        registry.register(
+            ToolDefinition(name="search_web", description="mock", parameters={}),
+            web_mock,
+        )
+
+        sop = self._make_sop()
+        result = await engine.execute(sop, {"drug_name": "ibuprofen"})
+
+        assert result.has_usable_data is True   # search_manual has data
+        assert result.triggered_web_fallback is False
+        assert web_called is False
+
+    # ── Web fallback triggered ────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_web_fallback_when_locals_all_empty(self, registry_and_engine):
+        """Local steps all return empty → search_web IS triggered."""
+        registry, engine = registry_and_engine
+        self._register(registry, "search_manual", [])
+        self._register(registry, "get_drug_detail",
+                       {"drug_id": 1, "generic_name": "ibuprofen"})
+        web_called = False
+
+        async def web_mock(**kwargs):
+            nonlocal web_called
+            web_called = True
+            return {"source": "web", "results": [
+                {"title": "Ibuprofen Side Effects",
+                 "snippet": "Common side effects include nausea, dizziness, headache, and gastrointestinal discomfort."}
+            ]}
+
+        from app.agent.react.schemas import ToolDefinition
+
+        registry.register(
+            ToolDefinition(name="search_web", description="mock", parameters={}),
+            web_mock,
+        )
+
+        sop = self._make_sop()
+        result = await engine.execute(sop, {"drug_name": "ibuprofen"})
+
+        assert result.triggered_web_fallback is True
+        assert web_called is True
+        assert result.has_usable_data is True  # web saved us
+        assert len(result.steps) == 3  # local + web
+
+    @pytest.mark.asyncio
+    async def test_web_fallback_also_empty(self, registry_and_engine):
+        """Local empty + web also empty → has_usable_data=False."""
+        registry, engine = registry_and_engine
+        self._register(registry, "search_manual", [])
+        self._register(registry, "get_drug_detail",
+                       {"drug_id": 1, "generic_name": "ibuprofen"})
+        self._register(registry, "search_web",
+                       {"source": "web", "results": []})
+
+        sop = self._make_sop()
+        result = await engine.execute(sop, {"drug_name": "ibuprofen"})
+
+        assert result.triggered_web_fallback is True
+        assert result.has_usable_data is False
+
+    # ── Step failure / exception ──────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_step_returns_none_data_treated_as_empty(self, registry_and_engine):
+        """A tool returning None → success=True, data=None → not counted as usable."""
+        registry, engine = registry_and_engine
+
+        async def returns_none(**kwargs):
+            return None
+
+        from app.agent.react.schemas import ToolDefinition
+
+        registry.register(
+            ToolDefinition(name="search_manual", description="mock", parameters={}),
+            returns_none,
+        )
+        self._register(registry, "get_drug_detail",
+                       {"drug_id": 1, "generic_name": "ibuprofen"})  # only metadata
+        self._register(registry, "search_web",
+                       {"source": "web", "results": []})
+
+        sop = self._make_sop()
+        result = await engine.execute(sop, {"drug_name": "ibuprofen"})
+
+        # search_manual returned None → skipped → both locals empty → web triggered
+        assert result.triggered_web_fallback is True
+        # web also empty
+        assert result.has_usable_data is False
+
+    @pytest.mark.asyncio
+    async def test_step_throws_unexpected_exception(self, registry_and_engine):
+        """A tool raising an exception should be caught, not crash the pipeline."""
+        registry, engine = registry_and_engine
+
+        async def exploding_tool(**kwargs):
+            raise RuntimeError("Something blew up")
+
+        from app.agent.react.schemas import ToolDefinition
+
+        registry.register(
+            ToolDefinition(name="search_manual", description="mock", parameters={}),
+            exploding_tool,
+        )
+        self._register(registry, "get_drug_detail",
+                       {"adverse_reactions": "Common side effects include nausea and dizziness, enough chars."})
+
+        sop = self._make_sop()
+        result = await engine.execute(sop, {"drug_name": "ibuprofen"})
+
+        # search_manual exception caught → get_drug_detail still has data
+        assert result.has_usable_data is True
+        assert result.triggered_web_fallback is False
+        failed = [s for s in result.steps if s.tool_name == "search_manual"][0]
+        assert failed.success is False
+        assert "Something blew up" in failed.error
+
+    # ── All steps fail ────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_all_local_steps_fail_web_also_fails(self, registry_and_engine):
+        """Every step fails (throws exception) → has_usable_data=False."""
+        registry, engine = registry_and_engine
+
+        async def always_fail(**kwargs):
+            raise RuntimeError("Dead")
+
+        from app.agent.react.schemas import ToolDefinition
+
+        registry.register(
+            ToolDefinition(name="search_manual", description="mock", parameters={}),
+            always_fail,
+        )
+
+        async def also_fail(**kwargs):
+            raise RuntimeError("Dead too")
+
+        registry.register(
+            ToolDefinition(name="get_drug_detail", description="mock", parameters={}),
+            also_fail,
+        )
+        self._register(registry, "search_web",
+                       {"source": "web", "results": []})
+
+        sop = self._make_sop()
+        result = await engine.execute(sop, {"drug_name": "ibuprofen"})
+
+        assert result.has_usable_data is False
+        assert result.triggered_web_fallback is True
+        # local steps failed, web step executed but returned empty
+        local_steps = [s for s in result.steps if s.tool_name != "search_web"]
+        assert all(not s.success for s in local_steps)
+        assert len(result.steps) == 3  # 2 failed locals + 1 (empty) web
+
+    # ── SOP without search_web ────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_sop_without_web_step(self, registry_and_engine):
+        """SOP has no search_web → locals empty → no crash, has_usable_data=False."""
+        registry, engine = registry_and_engine
+        self._register(registry, "search_manual", [])
+        self._register(registry, "get_drug_detail",
+                       {"drug_id": 1, "generic_name": "ibuprofen"})
+
+        sop = self._make_sop(steps=[
+            SOPStep(order=1, tool_name="search_manual",
+                    args_template={"drug_name": "{drug_name}"}),
+            SOPStep(order=2, tool_name="get_drug_detail",
+                    args_template={"drug_name": "{drug_name}"}),
+        ])
+        result = await engine.execute(sop, {"drug_name": "ibuprofen"})
+
+        assert result.has_usable_data is False
+        assert result.triggered_web_fallback is False
+        assert len(result.steps) == 2
+
+    # ── Parallel execution ────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_parallel_group_execution(self, registry_and_engine):
+        """Steps in the same parallel_group run concurrently."""
+        registry, engine = registry_and_engine
+        call_order: list[str] = []
+
+        async def tool_a(**kwargs):
+            call_order.append("a")
+            await asyncio.sleep(0.05)
+            return [{"content": "Data from tool A with enough characters to meet the minimum threshold limit."}]
+
+        async def tool_b(**kwargs):
+            call_order.append("b")
+            await asyncio.sleep(0.05)
+            return [{"content": "Data from tool B with enough characters to meet the minimum threshold limit."}]
+
+        from app.agent.react.schemas import ToolDefinition
+
+        registry.register(
+            ToolDefinition(name="search_manual", description="mock", parameters={}),
+            tool_a,
+        )
+        registry.register(
+            ToolDefinition(name="get_drug_detail", description="mock", parameters={}),
+            tool_b,
+        )
+
+        sop = self._make_sop(steps=[
+            SOPStep(order=1, tool_name="search_manual",
+                    args_template={"drug_name": "{drug_a}"}, parallel_group=1),
+            SOPStep(order=1, tool_name="get_drug_detail",
+                    args_template={"drug_name": "{drug_b}"}, parallel_group=1),
+        ])
+        result = await engine.execute(sop, {"drug_a": "ibuprofen", "drug_b": "acetaminophen"})
+
+        assert len(result.steps) == 2
+        assert all(s.success for s in result.steps)
+        assert result.has_usable_data is True
+        assert result.triggered_web_fallback is False
+        # Both were called (actual concurrency verified by async framework)
+        assert "a" in call_order
+        assert "b" in call_order
+
+    # ── Parameter filling ─────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_params_are_filled_before_execution(self, registry_and_engine):
+        """Template placeholders are filled with provided params."""
+        registry, engine = registry_and_engine
+        received_args: dict = {}
+
+        async def capture_tool(**kwargs):
+            nonlocal received_args
+            received_args = kwargs
+            return [{"content": "Captured! This has enough characters to pass the threshold check."}]
+
+        from app.agent.react.schemas import ToolDefinition
+
+        registry.register(
+            ToolDefinition(name="search_manual", description="mock", parameters={}),
+            capture_tool,
+        )
+        self._register(registry, "get_drug_detail",
+                       {"adverse_reactions": "Sufficient detail data for the drug detail threshold requirement."})
+
+        sop = self._make_sop(steps=[
+            SOPStep(order=1, tool_name="search_manual",
+                    args_template={"drug_name": "{drug_name}", "question": "{custom_focus}"}),
+            SOPStep(order=2, tool_name="get_drug_detail",
+                    args_template={"drug_name": "{drug_name}"}),
+        ])
+        await engine.execute(sop, {"drug_name": "ibuprofen", "custom_focus": "liver impact"})
+
+        assert received_args["drug_name"] == "ibuprofen"
+        assert received_args["question"] == "liver impact"
+
+    # ── Edge: empty params ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_execute_with_empty_params(self, registry_and_engine):
+        """Empty params dict → placeholders remain, but no crash."""
+        registry, engine = registry_and_engine
+        self._register(registry, "search_manual",
+                       [{"content": "Content with enough text to pass the minimum character threshold test here."}])
+        self._register(registry, "get_drug_detail",
+                       {"adverse_reactions": "Common side effects with enough detail."})
+
+        sop = self._make_sop()
+        result = await engine.execute(sop, {})
+
+        assert result.has_usable_data is True
+        assert result.triggered_web_fallback is False

@@ -148,6 +148,8 @@ class SOPEngine:
     async def execute(self, sop: SOP, params: dict[str, str]) -> SOPResult:
         """按 SOP 执行工具链。
 
+        search_web 在其他步骤之后执行，且仅当本地数据源全部空时触发。
+
         Args:
             sop:    任务类型对应的 SOP 定义
             params: 已填充占位符的参数字典。
@@ -159,9 +161,12 @@ class SOPEngine:
         all_results: list[StepResult] = []
         all_data: list[Any] = []
 
-        # ── 1. 按并行组分组执行 ──
-        groups = self._group_by_parallel(sop.steps)
+        # ── 1. 拆分本地步骤与联网步骤 ──
         web_step = self._find_web_step(sop)
+        local_steps = [s for s in sop.steps if s.tool_name != "search_web"]
+
+        # ── 2. 按并行组分组执行本地步骤 ──
+        groups = self._group_by_parallel(local_steps)
 
         for group_idx, group in enumerate(groups):
             # 同组 step 并行执行
@@ -171,7 +176,7 @@ class SOPEngine:
                 if gr.success and gr.data is not None:
                     all_data.append(gr.data)
 
-        # ── 2. 判断是否需要联网兜底 ──
+        # ── 3. 判断是否需要联网兜底 ──
         triggered_web = False
         has_usable = _has_usable_data(all_data)
 

@@ -57,7 +57,12 @@ class GetDrugDetailTool(BaseTool):
 
 
 def _drug_to_dict(drug, drug_name: str) -> dict:
-    """将 Drug ORM 对象转为 dict。兼容 dict 输入。"""
+    """将 Drug ORM 对象转为 dict。兼容 dict 输入。
+
+    映射 DB 实际字段 → 统一的输出格式。
+    DB 中不存在的字段（adverse_reactions/contraindications/interactions/precautions）
+    来自 Milvus 向量检索（search_manual），不在此工具中返回。
+    """
     if isinstance(drug, dict):
         return drug
     return {
@@ -65,10 +70,13 @@ def _drug_to_dict(drug, drug_name: str) -> dict:
         "generic_name": getattr(drug, "generic_name", drug_name),
         "trade_names": getattr(drug, "trade_names", ""),
         "category": getattr(drug, "category", ""),
-        "indications": getattr(drug, "indications", ""),
-        "usage_dosage": getattr(drug, "usage_dosage", ""),
-        "adverse_reactions": getattr(drug, "adverse_reactions", ""),
-        "contraindications": getattr(drug, "contraindications", ""),
-        "interactions": getattr(drug, "interactions", ""),
-        "precautions": getattr(drug, "precautions", ""),
+        "dosage_form": getattr(drug, "dosage_form", ""),
+        "strength": getattr(drug, "strength", ""),
+        "otc_type": getattr(drug, "otc_type", ""),
+        "active_ingredients": getattr(drug, "active_ingredients", []),
+        # DB 实际字段 → 统一输出名
+        "indications": getattr(drug, "indication_summary", ""),
+        "usage_dosage": getattr(drug, "usage_adult", ""),
+        "usage_child": getattr(drug, "usage_child", ""),
+        "usage_elderly": getattr(drug, "usage_elderly", ""),
     }

@@ -343,34 +343,32 @@ async def _fetch_candidates(
 
 RECOMMEND_SYSTEM_PROMPT = """\
 你是 OTC 药店执业药师。系统已为你准备好推荐药品的详细信息，你的任务是：
-1. 为每个药品撰写简短推荐理由（2-3句话，结合顾客症状），推荐理由还结合用户的症状及药品来进行解释
+1. 为每个药品撰写具体的推荐理由（2-3句话，必须结合顾客症状 + 药品真实适应症）
 2. 生成一段自然、专业、流畅的推荐回复
 
+## 推荐理由要求（重要）
+- 必须结合用户的症状（如"干咳"）和药品的真实适应症来写，说明"为什么这个药适合你"
+- 格式示例："您提到干咳，右美沙芬是中枢性镇咳药，专门针对无痰干咳，效果明确且不成瘾"
+- **绝对禁止**使用"适用于缓解相关症状""对症治疗""针对您的症状"等万能模板——这等于没写理由
+- 如果数据不足以写出具体理由，应写"本药品主要用于..."而非编造
+
 ## 输出规范
-你不是在复述说明书。你是在向普通 OTC 用户解释：“这个药为什么适合他”。
+你不是在复述说明书。你是在向普通 OTC 用户解释："这个药为什么适合他"。
 请遵循：
-    -1. 优先解释“为什么推荐”，而不是罗列说明书字段。
-    -2. 不要输出：
-        【药品名称】
-        【作用类别】
-        【适应症】
-        等数据库标签。
-
+    -1. 优先解释"为什么推荐"，而不是罗列说明书字段。
+    -2. **绝对禁止**输出以下数据库标签：
+        【药品名称】【作用类别】【适应症】【不良反应】【药物相互作用】
     -3. 不要重复药品全称超过一次。
-
-    -4. 不要重复：
-        商品名 / 英文名 / 成分类别，
-        除非用户明确询问。
-
+    -4. 不要重复：商品名 / 英文名 / 成分类别，除非用户明确询问。
     -5. 用自然语言总结，而不是粘贴说明书原文。
-    -6. “作用功效”限制在 1~2 句话。
-    -7. “注意事项”只保留：与当前用户场景强相关的风险。
+    -6. "作用功效"限制在 1~2 句话。
+    -7. "注意事项"只保留：与当前用户场景强相关的风险。
     -8. 不要输出与当前症状无关的信息。
     -9. 避免医学百科式解释。
-
+    -10. 不要使用【】或类似的数据库标签包裹任何文本。
 
 ## 核心约束
-- ⚠️ 所有药品信息必须来自系统提供的数据，不得编造任何功效、用法、剂量或禁忌
+- 所有药品信息必须来自系统提供的数据，不得编造任何功效、用法、剂量或禁忌
 - 数据中为空的字段直接跳过，不编造内容填补
 - 不要提及"评分""排名""score"等内部排序指标
 - 不要生成法律免责声明（系统会自动追加）
@@ -383,24 +381,17 @@ RECOMMEND_SYSTEM_PROMPT = """\
 - 换药/不满意："为您更换以下备选方案："
 - 结合顾客主诉症状自然过渡
 
-**药品介绍**（每个药品用 ### 标题）：
-- 药品名称 + 商品名，一句话点明为什么适合顾客
-- 作用功效（如有）
+**药品介绍**（每个药品用 ## 标题）：
+- ## 药品名
+- 推荐理由（2-3句话，结合症状和适应症解释为什么推荐）
+- 作用功效（1-2句自然描述，不要用标签）
 - 用法用量（如有，注意年龄/人群差异）
-- 推荐的药品用分割线分开，层次分明
-- ⚠️ 注意事项（如有禁忌或重要警示）
+- 注意事项（如有禁忌或重要警示，以"注意"开头）
 
 **结尾**（1-2句即可）：
 - 简短温馨提示，如"如果症状持续不缓解或加重，建议及时就医"
 - 不要长篇大论
 
-## 风格要求
-- 专业、清晰、亲切，像药店执业药师在跟顾客面对面交流
-- 用"您"称呼顾客，语言通俗但不随意
-- 涉及剂量、禁忌时措辞准确严谨，使用"禁用""慎用""不宜"等规范表述
-- 如果顾客是儿童/老人/孕妇，在注意事项中重点提醒
-- 回复长度适中：每个药品 3~5 个要点，总体不宜过长
-- 使用 Markdown 格式，要点用 **加粗标签** 引导
 """
 
 
@@ -460,7 +451,7 @@ async def _generate_recommend_response(
             ],
             schema=RecommendOutput,
             temperature=0.4,
-            max_tokens=1024,
+            max_tokens=2048,
         )
         # 追加免责声明（LLM 不生成，系统保证合规措辞）
         output.response = output.response + DISCLAIMER
@@ -520,17 +511,26 @@ async def _fetch_rag_batch(
 
 
 def _extract_efficacy(chunks: list[Chunk], drug) -> str:
+    """提取药品功效说明，利用 chunk.section 精确过滤非功效信息。
+
+    排除的 section：禁忌、不良反应、药物相互作用、注意事项。
+    优先取高相似度的非排除 section chunk。
+    降级策略：DB indication_summary → 空字符串（宁缺毋滥）。
+    """
+    EXCLUDED = frozenset({"禁忌", "不良反应", "药物相互作用", "注意事项"})
+
     if chunks:
         sorted_chunks = sorted(chunks, key=lambda c: c.score, reverse=True)
+        # 优先：取第一个 section 不在排除列表的 chunk
         for chunk in sorted_chunks:
-            text = chunk.content.strip()
-            if any(kw in text[:20] for kw in ("禁忌", "不良反应", "药物相互作用")):
-                continue
-            if len(text) > 15:
-                return _truncate(text, 200)
-        if sorted_chunks:
-            return _truncate(sorted_chunks[0].content, 200)
-    if drug:
+            if chunk.section not in EXCLUDED and len(chunk.content.strip()) > 15:
+                return _truncate(chunk.content, 200)
+        # 降级：全部被排除 → 取第一个非空 chunk（宽容处理）
+        for chunk in sorted_chunks:
+            if len(chunk.content.strip()) > 15:
+                return _truncate(chunk.content, 200)
+    # DB 兜底
+    if drug and drug.indication_summary:
         return drug.indication_summary
     return ""
 
@@ -556,23 +556,44 @@ def _extract_usage(drug, slots: dict, chunks: list[Chunk]) -> str:
 
 
 def _extract_warnings(chunks: list[Chunk]) -> str:
+    """提取药品注意事项，优先用 section 过滤，排除已用于 efficacy 的 chunk。
+
+    返回自然语言拼接的警告文本（最多 150 字），去重、完整句。
+    """
     if not chunks:
         return ""
-    warning_chunks = [c for c in chunks if c.section in ("禁忌", "注意事项", "不良反应")]
+    # 用 section 精确匹配，降级到内容关键词匹配
+    WARNING_SECTIONS = frozenset({"禁忌", "注意事项", "不良反应"})
+    WARNING_KW = ("禁用", "慎用", "避免", "注意", "不宜", "禁止")
+
+    warning_chunks = [c for c in chunks if c.section in WARNING_SECTIONS]
     if not warning_chunks:
-        warning_chunks = [c for c in chunks if any(
-            kw in c.content for kw in ("禁用", "慎用", "避免", "注意", "不宜")
-        )]
-    warnings = []
+        warning_chunks = [c for c in chunks if any(kw in c.content for kw in WARNING_KW)]
+
+    seen: set[str] = set()
+    parts: list[str] = []
     for chunk in warning_chunks[:3]:
         text = chunk.content.strip()
+        # 去重：相同内容不重复
+        if text in seen:
+            continue
+        seen.add(text)
+        # 取完整的第一句
         sentences = text.replace("\n", " ").split("。")
-        first = sentences[0].strip() + "。"
-        if first and first not in warnings and len(first) > 5:
-            warnings.append(first)
-        if len(warnings) >= 2:
+        first = sentences[0].strip()
+        if first and len(first) > 5:
+            # 去掉残留的数据库标签记号【xxx】
+            for tag in ("【药物相互作用】", "【不良反应】", "【禁忌】", "【注意事项】"):
+                first = first.replace(tag, "")
+            first = first.strip()
+            if first and first not in parts:
+                parts.append(first)
+        if len(parts) >= 2:
             break
-    return " ".join(warnings) if warnings else ""
+
+    if not parts:
+        return ""
+    return "；".join(parts) + "。"
 
 
 def _truncate(text: str, max_len: int) -> str:

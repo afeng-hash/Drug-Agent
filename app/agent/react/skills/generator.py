@@ -24,6 +24,7 @@ GENERATE_PROMPT = """你是 OTC 药店智能助手。基于以下查询结果回
 - 语言专业、清晰、亲切，像药店执业药师
 - 涉及剂量、禁忌等重要信息时，强调"请以说明书为准"
 - 不要提及"评分""排名""数据库"等系统内部概念
+- **回复控制在 800 字以内**，精简表达，避免冗余
 
 ## 用户问题
 {query}
@@ -55,6 +56,19 @@ _WEB_SOURCE_RULES = (
     "请以药品说明书或医生/药师意见为准」。"
     "不要在每个信息点后逐一标注 URL。"
 )
+
+# ── 后处理常量 ────────────────────────────────────────────
+
+_WEB_DISCLAIMER = (
+    "\n\n---\n"
+    "⚠️ 以上部分信息来自互联网搜索，仅供参考，"
+    "请以药品说明书或医生/药师意见为准。"
+)
+
+_SENTENCE_ENDS = frozenset("。！？\n）)】]")
+
+# 来源标注规则中用于去重检测的关键词
+_DISCLAIMER_DETECT_KEYWORDS = ("互联网搜索", "仅供参考")
 
 
 class ResponseGenerator:
@@ -134,7 +148,20 @@ class ResponseGenerator:
                 profile=self._profile,
             )
             content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return content or sop.fallback_response
+            if not content:
+                return sop.fallback_response
+
+            # ── 后处理：截断检测 ──
+            finish_reason = response.get("choices", [{}])[0].get("finish_reason", "")
+            if finish_reason == "length":
+                content = _trim_incomplete_sentence(content)
+
+            # ── 后处理：联网搜索强制追加免责声明 ──
+            if sop_result.triggered_web_fallback:
+                if not _has_disclaimer(content):
+                    content = content.rstrip() + _WEB_DISCLAIMER
+
+            return content
 
         except Exception as e:
             logger.error("ResponseGenerator LLM call failed: %s", e)
@@ -205,8 +232,14 @@ class ResponseGenerator:
                 "generic_name": "药品名称",
                 "trade_names": "商品名",
                 "category": "类别",
+                "dosage_form": "剂型",
+                "strength": "规格",
+                "otc_type": "OTC类别",
+                "active_ingredients": "有效成分",
                 "indications": "适应症",
-                "usage_dosage": "用法用量",
+                "usage_dosage": "成人用法用量",
+                "usage_child": "儿童用法用量",
+                "usage_elderly": "老人用法用量",
                 "adverse_reactions": "不良反应",
                 "contraindications": "禁忌",
                 "interactions": "药物相互作用",
@@ -252,3 +285,23 @@ class ResponseGenerator:
 {formatted}
 
 （以上信息由系统自动查询整理，如需更详细的信息，建议咨询医生或药师。）"""
+
+
+# ── 模块级辅助函数 ─────────────────────────────────────────
+
+
+def _trim_incomplete_sentence(text: str) -> str:
+    """去除因 max_tokens 截断导致的不完整末句。
+
+    从末尾向前扫描，找到最后一个完整的句子结束符（。！？换行等），
+    截断该位置之后的内容。如果找不到任何结束符，返回原文。
+    """
+    for i in range(len(text) - 1, -1, -1):
+        if text[i] in _SENTENCE_ENDS:
+            return text[: i + 1]
+    return text
+
+
+def _has_disclaimer(text: str) -> bool:
+    """检测文本中是否已包含联网搜索免责声明。"""
+    return any(kw in text for kw in _DISCLAIMER_DETECT_KEYWORDS)

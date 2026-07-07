@@ -260,9 +260,17 @@ def _make_react(
         llm_client=llm_client,
         profile=classifier_profile,
     )
+    # ResponseGenerator: 独立 profile，max_tokens 更大
+    # — 长回复（对比表格、安全提醒等）需要 2048 tokens
+    # — 与 ReactAgent 的 1024 分离，避免截断
+    generator_profile = LLMProfile(
+        model=react_profile.model if react_profile else "qwen-plus",
+        temperature=0.3,
+        max_tokens=2048,
+    )
     response_generator = ResponseGenerator(
         llm_client=llm_client,
-        profile=react_profile,
+        profile=generator_profile,
     )
 
     # ── 构建增强 system prompt（ReAct fallback 用） ──

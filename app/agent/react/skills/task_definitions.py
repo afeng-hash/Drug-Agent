@@ -180,16 +180,16 @@ SPECIAL_POPULATION_SOP = SOP(
 DRUG_INTERACTION_SOP = SOP(
     task_type=TaskType.DRUG_INTERACTION,
     steps=[
-        # 步骤 1: 并行查询每种药的相互作用信息
+        # 步骤 1: 并行查询每种药的相互作用信息（top_k=3，并行 2 路共 6 chunks）
         SOPStep(order=1, tool_name="search_manual",
-                args_template={"drug_name": "{drug_a}", "question": "药物相互作用", "top_k": "5"},
+                args_template={"drug_name": "{drug_a}", "question": "药物相互作用", "top_k": "3"},
                 parallel_group=1),
         SOPStep(order=1, tool_name="search_manual",
-                args_template={"drug_name": "{drug_b}", "question": "药物相互作用", "top_k": "5"},
+                args_template={"drug_name": "{drug_b}", "question": "药物相互作用", "top_k": "3"},
                 parallel_group=1),
         # 步骤 2: 交叉检索
         SOPStep(order=2, tool_name="search_manual",
-                args_template={"drug_name": "{drug_a}", "question": "{drug_b} 相互作用", "top_k": "5"}),
+                args_template={"drug_name": "{drug_a}", "question": "{drug_b} 相互作用", "top_k": "3"}),
         # 步骤 3: 联网兜底
         SOPStep(order=3, tool_name="search_web",
                 args_template={"query": "{drug_a} {drug_b} 相互作用 能否同服", "num_results": "5"}),
@@ -221,18 +221,18 @@ DRUG_INTERACTION_SOP = SOP(
 DRUG_COMPARISON_SOP = SOP(
     task_type=TaskType.DRUG_COMPARISON,
     steps=[
-        # 步骤 1: 并行从多个维度查询每种药
+        # 步骤 1: 并行从多个维度查询每种药（top_k=3，并行 4 路共 12 chunks）
         SOPStep(order=1, tool_name="search_manual",
-                args_template={"drug_name": "{drug_a}", "question": "功效 适应症", "top_k": "5"},
+                args_template={"drug_name": "{drug_a}", "question": "功效 适应症", "top_k": "3"},
                 parallel_group=1),
         SOPStep(order=1, tool_name="search_manual",
-                args_template={"drug_name": "{drug_a}", "question": "副作用 禁忌", "top_k": "5"},
+                args_template={"drug_name": "{drug_a}", "question": "副作用 禁忌", "top_k": "3"},
                 parallel_group=1),
         SOPStep(order=1, tool_name="search_manual",
-                args_template={"drug_name": "{drug_b}", "question": "功效 适应症", "top_k": "5"},
+                args_template={"drug_name": "{drug_b}", "question": "功效 适应症", "top_k": "3"},
                 parallel_group=1),
         SOPStep(order=1, tool_name="search_manual",
-                args_template={"drug_name": "{drug_b}", "question": "副作用 禁忌", "top_k": "5"},
+                args_template={"drug_name": "{drug_b}", "question": "副作用 禁忌", "top_k": "3"},
                 parallel_group=1),
         # 步骤 2: 联网兜底
         SOPStep(order=2, tool_name="search_web",
