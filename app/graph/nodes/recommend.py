@@ -7,22 +7,20 @@ Recommend node — 症状 → OTC 药品匹配推荐。
   3. Neo4j KG 查候选药品 + 禁忌过滤
   4. ScoringPipeline 确定性评分排序
   5. RAG 检索说明书片段（并行）
-  6. LLM 一次调用生成推荐理由 + 完整回复（替代旧的两次调用 + 模板拼接）
-  7. 拼装结果写入 state
+  6. LLM 生成推荐回复文案（DB + RAG 全量透传，纯文本输出）
+  7. 拼装结果写入 state（match_reason 确定性生成）
 
 数据来源分工：
   - Neo4j KG     → 症状→药品映射 + 禁忌关系
   - PostgreSQL   → 药品元数据 + 权重配置
   - ScoringPipeline → 确定性评分排序（Evidence → Features → Weighted Score）
-  - Milvus/RAG   → 药品说明书（作用功效、注意事项）
-  - LLM          → 推荐理由 + 自然语言回复（结合症状的完整推荐文案）
+  - Milvus/RAG   → 药品说明书片段（保留章节标签，由 LLM 自行理解）
+  - LLM          → 自然语言推荐文案（纯文本输出，单次调用）
 """
 
 import asyncio
 import json
 import logging
-
-from pydantic import BaseModel, Field
 
 from app.db.repositories.drug import DrugRepository
 from app.db.repositories.weight_config import WeightConfigRepository
@@ -35,24 +33,7 @@ from app.scorer.engine import normalize_for_display
 
 logger = logging.getLogger(__name__)
 
-# ── LLM 推荐回复 Schema ──────────────────────────────────
-
-class DrugReasonItem(BaseModel):
-    """LLM 为单个药品生成的推荐理由。"""
-    drug_id: int
-    generic_name: str
-    match_reason: str = Field(
-        description="通俗推荐理由，2-3句，结合用户具体症状说明为什么推荐"
-    )
-
-
-class RecommendOutput(BaseModel):
-    """LLM 一次性生成的推荐输出：每个药的推荐理由 + 完整回复文本。"""
-    drugs: list[DrugReasonItem] = Field(max_length=3)
-    response: str = Field(description="完整的用户回复文本，Markdown格式，不含免责声明")
-
-
-# ── 回复模板 ──────────────────────────────────────────────
+# ── 免责声明 ──────────────────────────────────────────────
 
 DISCLAIMER = (
     "\n\n---\n"
@@ -75,7 +56,7 @@ async def recommend_node(
 
     Args:
         state:             当前对话状态
-        llm_client:        LLM 客户端（仅用于生成推荐理由文案）
+        llm_client:        LLM 客户端（仅用于生成推荐文案）
         drug_repo:         药品仓库（已绑定 DB session，PG 降级备用）
         weight_repo:       权重配置仓库（已绑定 DB session）
         retriever:         Milvus 说明书检索器
@@ -182,26 +163,28 @@ async def recommend_node(
     # ── 5. RAG 检索说明书 ──
     rag_map = await _fetch_rag_batch(retriever, top_drugs)
 
-    # ── 6. LLM 生成推荐回复（理由 + 完整回复，一次调用）──
+    # ── 6. LLM 生成推荐回复文案（纯文本，DB + RAG 全量透传）──
     top_candidates = [d for d in candidates if d.id in {sd.drug_id for sd in top_drugs}]
-    drug_data = _prepare_drug_data(top_drugs, top_candidates, rag_map, slots)
-    output = await _generate_recommend_response(llm_client, drug_data, summary)
+    drug_data = _prepare_drug_data(top_drugs, top_candidates, rag_map)
+    response = await _generate_recommend_response(llm_client, drug_data, summary, slots)
 
-    # ── 7. 拼装结果 ──
-    reasons_map = {r.drug_id: r.match_reason for r in output.drugs}
-    recommendations = [
-        {
+    # ── 7. 拼装结果 —— match_reason 确定性生成 ──
+    recommendations = []
+    for sd in top_drugs:
+        drug = next((d for d in top_candidates if d.id == sd.drug_id), None)
+        recommendations.append({
             "drug_id": sd.drug_id,
             "generic_name": sd.generic_name,
-            "match_reason": reasons_map.get(sd.drug_id, "根据您的症状匹配推荐"),
+            "match_reason": _build_match_reason(
+                sd.generic_name,
+                drug.indication_summary if drug else "",
+            ),
             "score": sd.display_score,
-        }
-        for sd in top_drugs
-    ]
+        })
 
     return {
         "recommendations": recommendations,
-        "response": output.response,
+        "response": response,
         "phase": "recommending",
         "node_events": [{
             "node": "recommend",
@@ -213,7 +196,7 @@ async def recommend_node(
 
 
 # ──────────────────────────────────────────────────────────
-# 辅助函数
+# 症状提取
 # ──────────────────────────────────────────────────────────
 
 
@@ -223,6 +206,11 @@ def _extract_symptom_names(symptoms: list) -> list[str]:
         s.get("name", s) if isinstance(s, dict) else str(s)
         for s in symptoms
     ]
+
+
+# ──────────────────────────────────────────────────────────
+# KG 禁忌过滤
+# ──────────────────────────────────────────────────────────
 
 
 async def _filter_by_kg_contraindications(
@@ -278,6 +266,11 @@ async def _filter_by_kg_contraindications(
             pass  # 单药查询失败不影响整体流程
 
     return excluded
+
+
+# ──────────────────────────────────────────────────────────
+# 候选药品查询
+# ──────────────────────────────────────────────────────────
 
 
 async def _fetch_candidates(
@@ -339,154 +332,9 @@ async def _fetch_candidates(
     return result
 
 
-# ── LLM 推荐回复 System Prompt ──────────────────────────
-
-RECOMMEND_SYSTEM_PROMPT = """\
-你是 OTC 药店执业药师。系统已为你准备好推荐药品的详细信息，你的任务是：
-1. 为每个药品撰写具体的推荐理由（2-3句话，必须结合顾客症状 + 药品真实适应症）
-2. 生成一段自然、专业、流畅的推荐回复
-
-## 推荐理由要求（重要）
-- 必须结合用户的症状（如"干咳"）和药品的真实适应症来写，说明"为什么这个药适合你"
-- 格式示例："您提到干咳，右美沙芬是中枢性镇咳药，专门针对无痰干咳，效果明确且不成瘾"
-- **绝对禁止**使用"适用于缓解相关症状""对症治疗""针对您的症状"等万能模板——这等于没写理由
-- 如果数据不足以写出具体理由，应写"本药品主要用于..."而非编造
-
-## 输出规范
-你不是在复述说明书。你是在向普通 OTC 用户解释："这个药为什么适合他"。
-请遵循：
-    -1. 优先解释"为什么推荐"，而不是罗列说明书字段。
-    -2. **绝对禁止**输出以下数据库标签：
-        【药品名称】【作用类别】【适应症】【不良反应】【药物相互作用】
-    -3. 不要重复药品全称超过一次。
-    -4. 不要重复：商品名 / 英文名 / 成分类别，除非用户明确询问。
-    -5. 用自然语言总结，而不是粘贴说明书原文。
-    -6. "作用功效"限制在 1~2 句话。
-    -7. "注意事项"只保留：与当前用户场景强相关的风险。
-    -8. 不要输出与当前症状无关的信息。
-    -9. 避免医学百科式解释。
-    -10. 不要使用【】或类似的数据库标签包裹任何文本。
-
-## 核心约束
-- 所有药品信息必须来自系统提供的数据，不得编造任何功效、用法、剂量或禁忌
-- 数据中为空的字段直接跳过，不编造内容填补
-- 不要提及"评分""排名""score"等内部排序指标
-- 不要生成法律免责声明（系统会自动追加）
-
-## 回复结构
-按以下层次自然组织，根据场景灵活调整，避免机械套用模板：
-
-**开头**（1-2句过渡）：
-- 首次推荐："根据您的情况，为您推荐以下药品："
-- 换药/不满意："为您更换以下备选方案："
-- 结合顾客主诉症状自然过渡
-
-**药品介绍**（每个药品用 ## 标题）：
-- ## 药品名
-- 推荐理由（2-3句话，结合症状和适应症解释为什么推荐）
-- 作用功效（1-2句自然描述，不要用标签）
-- 用法用量（如有，注意年龄/人群差异）
-- 注意事项（如有禁忌或重要警示，以"注意"开头）
-
-**结尾**（1-2句即可）：
-- 简短温馨提示，如"如果症状持续不缓解或加重，建议及时就医"
-- 不要长篇大论
-
-"""
-
-
-def _prepare_drug_data(
-    top_drugs: list,
-    top_candidates: list,
-    rag_map: dict[int, list[Chunk]],
-    slots: dict,
-) -> list[dict]:
-    """提取每个药品的结构化信息，作为 LLM 输入数据。"""
-    drug_data = []
-    for i, sd in enumerate(top_drugs, 1):
-        drug = next((d for d in top_candidates if d.id == sd.drug_id), None)
-        chunks = rag_map.get(sd.drug_id, [])
-
-        drug_data.append({
-            "rank": i,
-            "drug_id": sd.drug_id,
-            "generic_name": sd.generic_name,
-            "brand_names": drug.brand_names if drug else [],
-            "otc_type": drug.otc_type if drug else "",
-            "indication": drug.indication_summary if drug else "",
-            "efficacy": _extract_efficacy(chunks, drug),
-            "usage": _extract_usage(drug, slots, chunks),
-            "warnings": _extract_warnings(chunks),
-        })
-    return drug_data
-
-
-async def _generate_recommend_response(
-    llm_client: LLMClient,
-    drug_data: list[dict],
-    summary: str,
-) -> RecommendOutput:
-    """一次 LLM 调用生成推荐理由和完整回复文本。
-
-    Args:
-        llm_client: LLM 客户端
-        drug_data: 每个药品的结构化数据（efficacy/usage/warnings 已提取）
-        summary:   用户症状摘要
-
-    Returns:
-        RecommendOutput: 推荐理由 + 回复文本（含免责声明）。
-        LLM 失败时降级为模板拼接。
-    """
-    user_message = json.dumps(
-        {"summary": summary, "drugs": drug_data},
-        ensure_ascii=False,
-        indent=2,
-    )
-
-    try:
-        output = await llm_client.generate_structured(
-            messages=[
-                {"role": "system", "content": RECOMMEND_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            schema=RecommendOutput,
-            temperature=0.4,
-            max_tokens=2048,
-        )
-        # 追加免责声明（LLM 不生成，系统保证合规措辞）
-        output.response = output.response + DISCLAIMER
-        return output
-
-    except Exception as e:
-        logger.warning(
-            "LLM recommend response failed: %s, falling back to template", e
-        )
-        # ── 降级：用模板从 drug_data 拼回复 ──
-        lines = ["根据您的情况，为您推荐以下药品：\n"]
-        for d in drug_data:
-            brands = f"（{'、'.join(d['brand_names'])}）" if d["brand_names"] else ""
-            lines.append(f"### {d['rank']}. **{d['generic_name']}**{brands}")
-            lines.append(f"**推荐理由**：适用于缓解相关症状\n")
-            if d["efficacy"]:
-                lines.append(f"**作用功效**：{d['efficacy']}\n")
-            if d["usage"]:
-                lines.append(f"**用法用量**：{d['usage']}\n")
-            if d["warnings"]:
-                lines.append(f"**⚠️ 注意**：{d['warnings']}\n")
-            lines.append("")
-        fallback_response = "\n".join(lines) + DISCLAIMER
-
-        return RecommendOutput(
-            drugs=[
-                DrugReasonItem(
-                    drug_id=d["drug_id"],
-                    generic_name=d["generic_name"],
-                    match_reason="适用于缓解相关症状",
-                )
-                for d in drug_data
-            ],
-            response=fallback_response,
-        )
+# ──────────────────────────────────────────────────────────
+# RAG 检索
+# ──────────────────────────────────────────────────────────
 
 
 async def _fetch_rag_batch(
@@ -510,93 +358,186 @@ async def _fetch_rag_batch(
     return {drug_id: chunks for drug_id, chunks in results}
 
 
-def _extract_efficacy(chunks: list[Chunk], drug) -> str:
-    """提取药品功效说明，利用 chunk.section 精确过滤非功效信息。
+# ──────────────────────────────────────────────────────────
+# LLM 输入准备（DB + RAG 全量透传，不做预筛选）
+# ──────────────────────────────────────────────────────────
 
-    排除的 section：禁忌、不良反应、药物相互作用、注意事项。
-    优先取高相似度的非排除 section chunk。
-    降级策略：DB indication_summary → 空字符串（宁缺毋滥）。
+
+def _prepare_drug_data(
+    top_drugs: list,
+    top_candidates: list,
+    rag_map: dict[int, list[Chunk]],
+) -> list[dict]:
+    """组装 LLM 输入——DB 数据全给，RAG 数据全给。
+
+    不做预筛选、不截断、不替 LLM 做阅读理解。
+    RAG 片段保留"章节"标签，让 LLM 自行判断内容归属。
     """
-    EXCLUDED = frozenset({"禁忌", "不良反应", "药物相互作用", "注意事项"})
+    drug_data = []
+    for i, sd in enumerate(top_drugs, 1):
+        drug = next((d for d in top_candidates if d.id == sd.drug_id), None)
+        chunks = rag_map.get(sd.drug_id, [])
 
-    if chunks:
-        sorted_chunks = sorted(chunks, key=lambda c: c.score, reverse=True)
-        # 优先：取第一个 section 不在排除列表的 chunk
-        for chunk in sorted_chunks:
-            if chunk.section not in EXCLUDED and len(chunk.content.strip()) > 15:
-                return _truncate(chunk.content, 200)
-        # 降级：全部被排除 → 取第一个非空 chunk（宽容处理）
-        for chunk in sorted_chunks:
-            if len(chunk.content.strip()) > 15:
-                return _truncate(chunk.content, 200)
-    # DB 兜底
-    if drug and drug.indication_summary:
-        return drug.indication_summary
-    return ""
+        # DB 结构化信息：全量透传
+        db_info = {}
+        if drug:
+            db_info = {
+                "通用名": drug.generic_name,
+                "商品名": drug.brand_names,
+                "OTC类型": drug.otc_type,
+                "适应症": drug.indication_summary,
+                "成人用法": drug.usage_adult,
+                "儿童用法": drug.usage_child or "",
+                "老人用法": drug.usage_elderly or "",
+            }
+
+        # RAG 说明书片段：全量透传，保留章节标签让 LLM 自行理解
+        manuals = [
+            {"章节": c.section, "内容": c.content}
+            for c in chunks
+        ] if chunks else []
+
+        drug_data.append({
+            "排名": i,
+            "结构化信息": db_info,
+            "说明书片段": manuals,
+        })
+    return drug_data
 
 
-def _extract_usage(drug, slots: dict, chunks: list[Chunk]) -> str:
-    if not drug:
-        return ""
+# ──────────────────────────────────────────────────────────
+# LLM 推荐回复 Prompt
+# ──────────────────────────────────────────────────────────
+
+RECOMMEND_SYSTEM_PROMPT = """\
+你是 OTC 药店执业药师。基于以下药品数据，为顾客撰写推荐回复。
+
+## 数据说明
+- "结构化信息"：药品数据库字段（适应症、用法用量等）
+- "说明书片段"：从药品说明书向量检索到的段落，"章节"标注了来源（如"适应症""用法用量""注意事项""禁忌""不良反应""药物相互作用"）
+
+## 顾客信息
+顾客症状、年龄、特殊人群身份等信息已标注在输入中。
+
+## 要求
+1. 为每个药品写 1-2 句具体的推荐理由——从"适应症"字段或说明书"适应症"章节取信息，结合顾客症状说明为什么推荐
+2. 作用功效用 1-2 句通俗语言描述（从适应症相关章节取，不要取禁忌/药物相互作用章节的内容）
+3. 用法用量如有则说明（注意根据顾客年龄和特殊人群身份选择合适的用法）
+4. 如说明书"注意事项"章节有重要警示，简要提醒
+5. 数据为空的字段跳过，不编造；说明书片段为空则只用结构化信息
+6. 用自然语言，不要使用【】等数据库标签
+7. 不要生成免责声明（系统会自动追加）
+
+## 回复结构参考
+**开头**：1-2 句过渡
+**药品介绍**：每个药用 ### 标题，包含推荐理由 + 作用功效 + 用法用量 + 注意事项（如有）
+**结尾**：简短温馨提示，温馨提示要加粗
+"""
+
+
+# ──────────────────────────────────────────────────────────
+# LLM 调用 + 降级
+# ──────────────────────────────────────────────────────────
+
+
+async def _generate_recommend_response(
+    llm_client: LLMClient,
+    drug_data: list[dict],
+    summary: str,
+    slots: dict,
+) -> str:
+    """LLM 生成推荐回复文案——纯文本输出，不使用 structured output。
+
+    将 LLM 职责从"同时产出结构化理由 + 自然语言文案"简化为
+    "只产出一段自然语言文案"。推荐理由（match_reason）由
+    _build_match_reason() 确定性生成。
+
+    Args:
+        llm_client: LLM 客户端
+        drug_data:  每个药品的 DB + RAG 数据（_prepare_drug_data 输出）
+        summary:    用户症状摘要
+        slots:      用户 consult_slots（含年龄、特殊人群等）
+
+    Returns:
+        完整推荐回复文本（含免责声明）。
+        LLM 失败时降级为模板拼接。
+    """
+    # 构建顾客上下文
+    customer = {"症状摘要": summary}
     age = slots.get("age")
     special_pop = slots.get("special_population")
-    if special_pop in ("儿童", "child") or (age is not None and age < 12):
-        usage = drug.usage_child
-    elif special_pop in ("老人", "elderly") or (age is not None and age >= 60):
-        usage = drug.usage_elderly or drug.usage_adult
-    else:
-        usage = drug.usage_adult
-    if usage:
-        return usage
-    if chunks:
-        for chunk in sorted(chunks, key=lambda c: c.score, reverse=True):
-            if any(kw in chunk.content for kw in ("一次", "每日", "成人", "用法")):
-                return _truncate(chunk.content, 150)
-    return ""
+    if age is not None:
+        customer["年龄"] = age
+    if special_pop:
+        customer["特殊人群"] = special_pop
+
+    user_message = json.dumps(
+        {"顾客信息": customer, "推荐药品": drug_data},
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    try:
+        result = await llm_client.generate(
+            messages=[
+                {"role": "system", "content": RECOMMEND_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=0.4,
+            max_tokens=2048,
+        )
+        content = result["choices"][0]["message"]["content"]
+        return content + DISCLAIMER
+
+    except Exception as e:
+        logger.warning(
+            "LLM recommend response failed: %s, falling back to template", e
+        )
+        return _build_fallback_response(drug_data)
 
 
-def _extract_warnings(chunks: list[Chunk]) -> str:
-    """提取药品注意事项，优先用 section 过滤，排除已用于 efficacy 的 chunk。
+# ──────────────────────────────────────────────────────────
+# 确定性推荐理由（零 LLM 开销）
+# ──────────────────────────────────────────────────────────
 
-    返回自然语言拼接的警告文本（最多 150 字），去重、完整句。
+
+def _build_match_reason(generic_name: str, indication_summary: str) -> str:
+    """从药品适应症确定性生成推荐理由。
+
+    始终诚实、可溯源、零 LLM 开销。
     """
-    if not chunks:
-        return ""
-    # 用 section 精确匹配，降级到内容关键词匹配
-    WARNING_SECTIONS = frozenset({"禁忌", "注意事项", "不良反应"})
-    WARNING_KW = ("禁用", "慎用", "避免", "注意", "不宜", "禁止")
-
-    warning_chunks = [c for c in chunks if c.section in WARNING_SECTIONS]
-    if not warning_chunks:
-        warning_chunks = [c for c in chunks if any(kw in c.content for kw in WARNING_KW)]
-
-    seen: set[str] = set()
-    parts: list[str] = []
-    for chunk in warning_chunks[:3]:
-        text = chunk.content.strip()
-        # 去重：相同内容不重复
-        if text in seen:
-            continue
-        seen.add(text)
-        # 取完整的第一句
-        sentences = text.replace("\n", " ").split("。")
-        first = sentences[0].strip()
-        if first and len(first) > 5:
-            # 去掉残留的数据库标签记号【xxx】
-            for tag in ("【药物相互作用】", "【不良反应】", "【禁忌】", "【注意事项】"):
-                first = first.replace(tag, "")
-            first = first.strip()
-            if first and first not in parts:
-                parts.append(first)
-        if len(parts) >= 2:
-            break
-
-    if not parts:
-        return ""
-    return "；".join(parts) + "。"
+    if indication_summary:
+        first_sentence = indication_summary.split("。")[0].strip()
+        if len(first_sentence) > 8:
+            return f"{generic_name}主要用于{first_sentence}"
+    return f"{generic_name}是对症的非处方药，建议参考说明书确认是否适合您的情况"
 
 
-def _truncate(text: str, max_len: int) -> str:
-    if len(text) <= max_len:
-        return text
-    return text[:max_len].rsplit("。", 1)[0] + "。"
+# ──────────────────────────────────────────────────────────
+# 降级：模板拼接回复
+# ──────────────────────────────────────────────────────────
+
+
+def _build_fallback_response(drug_data: list[dict]) -> str:
+    """LLM 调用失败时，用模板从结构化数据拼接回复。"""
+    lines = ["根据您的情况，为您推荐以下药品：\n"]
+    for d in drug_data:
+        db = d.get("结构化信息", {})
+        name = db.get("通用名", "")
+        indication = db.get("适应症", "")
+        usage = db.get("成人用法", "")
+        brands = "、".join(db.get("商品名", []))
+
+        reason = _build_match_reason(name, indication)
+
+        lines.append(
+            f"### {d['排名']}. **{name}**"
+            + (f"（{brands}）" if brands else "")
+        )
+        lines.append(f"**推荐理由**：{reason}\n")
+        if indication:
+            lines.append(f"**作用功效**：{indication}\n")
+        if usage:
+            lines.append(f"**用法用量**：{usage}\n")
+        lines.append("")
+    return "\n".join(lines) + DISCLAIMER
