@@ -100,8 +100,10 @@ react 意图（仅当 action="react" 时使用）：
 4. **换药也是 workflow：**
    - "有没有便宜的""还有其他药吗" → workflow, intent="switch_drug"
 
-5. **phase 意识：**
-   - 如果系统刚推荐完药品，用户说"这个药副作用大吗" → react, intent="ask_drug"
+5. **phase 意识（关键）：**
+   - 如果系统刚推荐完药品，用户追问推荐药品的信息（作用/副作用/禁忌/用量/对比/相互作用）
+     → **只有 react，绝对不要加 workflow**
+     → 典型问法："上面这些药分别有什么作用""这些药哪个副作用小""这个药能吃多久"
    - 如果系统正在追问中，用户说"推荐吧" → workflow, intent="want_recommend"
 
 ## 反模式（不要做这些事）
@@ -151,6 +153,14 @@ react 意图（仅当 action="react" 时使用）：
 ### 示例 6: 换药
 用户: "有没有便宜一点的替代药"
 输出: {"actions": [{"action": "workflow", "intent": "switch_drug", "priority": 1}]}
+
+### 示例 7: 推荐后追问药品信息（⚠️ 纯 react，不加 workflow）
+用户: "上面这些药分别有什么作用"
+输出: {"actions": [{"action": "react", "intent": "ask_drug", "query": "上面这些药分别有什么作用", "priority": 1}]}
+
+### 示例 8: 推荐后追问副作用
+用户: "右美沙芬有什么副作用"
+输出: {"actions": [{"action": "react", "intent": "ask_drug", "query": "右美沙芬有什么副作用", "priority": 1}]}
 """
 
 # ────────────────────────────────────────────────────────────

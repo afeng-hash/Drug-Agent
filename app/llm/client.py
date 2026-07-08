@@ -102,8 +102,8 @@ class LLMClient:
                     "LLM call log will not be linked to a turn. "
                     "This may happen if the coroutine context was lost."
                 )
-        if self._log_callback:
-            asyncio.create_task(self._log_callback(data))
+        if LLMClient._log_callback:
+            asyncio.create_task(LLMClient._log_callback(data))
 
     def __init__(self, settings: "Settings"):
         """初始化 LLM 客户端。

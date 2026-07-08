@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 
 from app.db.repositories.safety_log import SafetyLogRepository
 from app.db.repositories.session import SessionRepository
+from app.graph.state import normalize_messages
 
 
 # ── 模块级高风险关键字检测回调 ──
@@ -105,8 +106,12 @@ async def end_node(
             pass  # 快照写入失败不阻塞主流程
 
     # ── 4. 异步触发高风险关键字检测 ──
-    messages = state.get("messages") or []
-    user_message = messages[-1].get("content", "") if messages else ""
+    # 注意：state.messages 经 LangGraph add_messages reducer 处理后已转为
+    # LangChain HumanMessage/AIMessage 对象，必须通过 normalize_messages()
+    # 转回 {"role":"...","content":"..."} dict 才能安全使用 .get()
+    raw_messages = state.get("messages") or []
+    normalized = normalize_messages(raw_messages)
+    user_message = normalized[-1].get("content", "") if normalized else ""
     if user_message:
         _schedule_keyword_check(session_id, user_message)
     if response:

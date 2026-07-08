@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     """uvicorn 绑定地址。0.0.0.0 表示接受所有网络接口的连接"""
 
-    app_port: int = 8000
+    app_port: int = 9000
     """uvicorn 监听端口"""
 
     debug: bool = True

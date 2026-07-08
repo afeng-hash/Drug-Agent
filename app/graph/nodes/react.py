@@ -224,6 +224,7 @@ async def _execute(
     sop = TASK_SOP_MAP[task_type]
 
     # ── Step 3.5: 构建 SOP 参数 ──
+    #todo
     sop_params = _build_sop_params(
         query=query,
         task_type=task_type,
