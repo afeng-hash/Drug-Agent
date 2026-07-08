@@ -109,18 +109,37 @@ class ResponseGenerator:
         sop_result: SOPResult,
         sop: SOP,
     ) -> str:
-        """将 SOP 执行结果转为自然语言回复。
+        """将 SOP 执行结果转为自然语言回复（非流式）。"""
+        return await self.generate_stream(
+            query=query,
+            sop_result=sop_result,
+            sop=sop,
+            on_token=None,
+        )
+
+    async def generate_stream(
+        self,
+        query: str,
+        sop_result: SOPResult,
+        sop: SOP,
+        on_token: callable = None,
+    ) -> str:
+        """将 SOP 执行结果转为自然语言回复（支持流式）。
 
         Args:
             query:      用户原始问题
             sop_result: SOP 执行结果
             sop:        SOP 定义（含回复结构、安全约束、兜底模板）
+            on_token:   每个 token 的回调（async callable），None 时非流式
 
         Returns:
             用户可见的最终回复文本
         """
         # 全部无数据 → 返回 SOP 兜底模板
         if not sop_result.has_usable_data:
+            if on_token:
+                for i in range(0, len(sop.fallback_response), 5):
+                    await on_token(sop.fallback_response[i:i + 5])
             return sop.fallback_response
 
         # 格式化数据
@@ -143,23 +162,39 @@ class ResponseGenerator:
         )
 
         try:
-            response = await self._llm.generate(
-                messages=[{"role": "user", "content": prompt}],
-                profile=self._profile,
-            )
-            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+            response = None
+            if on_token:
+                # ── 流式路径 ──
+                content = await self._llm.generate_with_stream_callback(
+                    messages=[{"role": "user", "content": prompt}],
+                    on_token=on_token,
+                    profile=self._profile,
+                )
+            else:
+                # ── 非流式路径（向后兼容）──
+                response = await self._llm.generate(
+                    messages=[{"role": "user", "content": prompt}],
+                    profile=self._profile,
+                )
+                content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+
             if not content:
                 return sop.fallback_response
 
-            # ── 后处理：截断检测 ──
-            finish_reason = response.get("choices", [{}])[0].get("finish_reason", "")
-            if finish_reason == "length":
-                content = _trim_incomplete_sentence(content)
+            # ── 后处理：截断检测（仅非流式）──
+            if response is not None:
+                finish_reason = response.get("choices", [{}])[0].get("finish_reason", "")
+                if finish_reason == "length":
+                    content = _trim_incomplete_sentence(content)
 
             # ── 后处理：联网搜索强制追加免责声明 ──
             if sop_result.triggered_web_fallback:
                 if not _has_disclaimer(content):
-                    content = content.rstrip() + _WEB_DISCLAIMER
+                    disclaimer = _WEB_DISCLAIMER
+                    content = content.rstrip() + disclaimer
+                    if on_token:
+                        for i in range(0, len(disclaimer), 5):
+                            await on_token(disclaimer[i:i + 5])
 
             return content
 

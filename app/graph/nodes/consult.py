@@ -11,6 +11,7 @@ Consult node — ReAct 症状问诊。
 """
 
 from app.agent.consult_agent import run_consult
+from app.api.routes.stream_events import push_step, push_text_chunked
 from app.graph.state import ConversationState, normalize_messages
 from app.llm.client import LLMClient
 
@@ -62,6 +63,7 @@ async def consult_node(
     dispatcher_params = dispatcher_result.get("params", {})
     dispatcher_intent = dispatcher_result.get("intent", "")
     consult_rounds = state.get("consult_rounds", 0)
+    q = state.get("_event_queue")
 
     # 如果 Dispatcher 标记了 reset_slots（用户切换了症状描述），清空旧槽位
     reset_slots = dispatcher_params.get("reset_slots", False)
@@ -81,6 +83,13 @@ async def consult_node(
     # 提取上一轮系统提问（帮助 LLM 理解用户当前在回答什么）
     last_question = _extract_last_assistant_question(messages)
 
+    # ── 推送 step: 开始收集 ──
+    new_round = consult_rounds + 1
+    await push_step(
+        q, "consult", "collecting",
+        f"正在收集症状信息 (第 {new_round}/{max_rounds} 轮)",
+    )
+
     # 委托给 Consult Agent（核心逻辑在 app/agent/consult_agent.py）
     result = await run_consult(
         llm_client=llm_client,
@@ -92,6 +101,26 @@ async def consult_node(
         dispatcher_params=dispatcher_params,
         last_question=last_question,
     )
+
+    # ── 推送 step: 槽位更新/完成 ──
+    if result.next_action == "done":
+        await push_step(
+            q, "consult", "done",
+            f"症状信息收集完成 ✓",
+            {"summary": result.summary},
+        )
+    else:
+        # 提取新增的槽位信息
+        new_slots_summary = _diff_slots(slots, result.updated_slots)
+        if new_slots_summary:
+            await push_step(
+                q, "consult", "slot_update",
+                f"已确认: {new_slots_summary}",
+                {"new_slots": _new_slots_dict(slots, result.updated_slots)},
+            )
+
+    # ── 推送 response 文本（分块模拟打字机） ──
+    await push_text_chunked(q, result.response, chunk_size=5, delay=0.02)
 
     return {
         "consult_slots": result.updated_slots,
@@ -107,3 +136,61 @@ async def consult_node(
             "round": consult_rounds + 1,
         }],
     }
+
+
+def _diff_slots(old: dict, new: dict) -> str:
+    """对比新旧槽位，生成人类可读的变化摘要。"""
+    parts = []
+    for key in ("symptoms", "temperature", "duration_days", "age",
+                "special_population", "chronic_conditions", "allergies",
+                "medications_taken"):
+        old_val = old.get(key)
+        new_val = new.get(key)
+        if _is_meaningful_change(old_val, new_val):
+            label = {
+                "symptoms": "症状", "temperature": "体温",
+                "duration_days": "持续", "age": "年龄",
+                "special_population": "特殊人群", "chronic_conditions": "慢性病",
+                "allergies": "过敏史", "medications_taken": "已用药",
+            }.get(key, key)
+            parts.append(f"{label}={_format_val(new_val)}")
+    return "; ".join(parts) if parts else ""
+
+
+def _new_slots_dict(old: dict, new: dict) -> dict:
+    """提取新增/变更的槽位（不在旧值中的部分）。"""
+    changed = {}
+    for key, new_val in new.items():
+        old_val = old.get(key)
+        if _is_meaningful_change(old_val, new_val):
+            changed[key] = new_val
+    return changed
+
+
+def _is_meaningful_change(old_val, new_val) -> bool:
+    """判断槽位值是否有意义的变化。"""
+    if new_val is None:
+        return False
+    if isinstance(new_val, list) and len(new_val) == 0:
+        return False
+    if old_val == new_val:
+        return False
+    # 空列表 → 非空列表 = 有意义
+    if isinstance(old_val, list) and len(old_val) == 0 and isinstance(new_val, list) and len(new_val) > 0:
+        return True
+    # None → 非空 = 有意义
+    if old_val is None and new_val is not None:
+        return True
+    return False
+
+
+def _format_val(val) -> str:
+    """格式化槽位值为可读字符串。"""
+    if isinstance(val, list):
+        return ", ".join(
+            v.get("name", str(v)) if isinstance(v, dict) else str(v)
+            for v in val
+        )
+    if isinstance(val, float):
+        return f"{val}°C"
+    return str(val)

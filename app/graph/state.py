@@ -287,6 +287,13 @@ class ConversationState(TypedDict):
       "📋 **免责声明**：本系统仅为辅助参考..."
     """
 
+    _event_queue: Any
+    """【内部】流式事件队列（asyncio.Queue），用于节点向 SSE 生成器推送实时事件。
+
+    不持久化到快照。chat.py 在 graph 执行前注入，节点通过 state.get("_event_queue") 获取。
+    为 None 时（如测试/CLI 场景），push_step/push_token 自动 no-op。
+    """
+
     node_events: list[dict[str, Any]]
     """【节点事件日志】本轮 Graph 运行中各节点的元数据记录。
 
@@ -404,6 +411,7 @@ def initial_state(
         recommendations=[],
         response="",
         node_events=[],
+        _event_queue=None,
     )
 
     # ── 从快照恢复结构化状态 ──

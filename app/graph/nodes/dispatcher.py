@@ -71,6 +71,10 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
     Returns:
         state 更新 dict：dispatcher_result, phase, node_events
     """
+    from app.api.routes.stream_events import push_step
+
+    q = state.get("_event_queue")
+
     # ── 1. 提取最新用户消息 ──
     messages = normalize_messages(state.get("messages", []))
     if not messages:
@@ -106,6 +110,7 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
     ]
 
     # ── 3. 调用 LLM 获取执行计划 ──
+    await push_step(q, "dispatcher", "analyzing", "正在分析用户意图...")
     try:
         decision = await llm_client.generate_structured(
             messages=prompt_messages,
@@ -115,9 +120,20 @@ async def dispatcher_node(state: ConversationState, llm_client: LLMClient) -> di
             node="dispatcher",
         )
     except Exception:
+        await push_step(q, "dispatcher", "fallback", "意图分析失败，使用默认计划")
         return _fallback_plan()
 
-    # ── 4. 构建 node_events ──
+    # ── 4. 推送决策结果 ──
+    action_summary = ", ".join(
+        f"{a.action}({a.intent})" for a in decision.actions
+    )
+    await push_step(
+        q, "dispatcher", "decided",
+        f"执行计划: {action_summary}",
+        {"actions": [a.model_dump() for a in decision.actions]},
+    )
+
+    # ── 5. 构建 node_events ──
     events = [{
         "node": "dispatcher",
         "actions": [

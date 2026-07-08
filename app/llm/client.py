@@ -440,6 +440,50 @@ class LLMClient:
             ))
             raise
 
+    async def generate_with_stream_callback(
+        self,
+        messages: list[dict[str, str]],
+        on_token: Callable[[str], Awaitable[None]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        profile: LLMProfile | None = None,
+        node: str | None = None,
+        session_id: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """流式生成 + 回调推送每个 token，返回完整文本。
+
+        用于需要真正打字机效果的场景（recommend_node、ResponseGenerator 等）。
+        每个 delta.content 通过 on_token 回调实时推送（供 SSE 使用），
+        同时累积完整文本作为返回值。
+
+        Args:
+            messages:    对话消息
+            on_token:    每个 token 的回调。None 时等同于 stream()
+            temperature: 采样温度。None 时使用 profile 默认值
+            max_tokens:  最大输出 token 数
+            profile:     场景配置
+            node:        调用节点标识
+            session_id:  关联会话 UUID
+
+        Returns:
+            累积的完整响应文本
+        """
+        full_text: list[str] = []
+        async for token in self.stream(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            profile=profile,
+            node=node,
+            session_id=session_id,
+            **kwargs,
+        ):
+            full_text.append(token)
+            if on_token:
+                await on_token(token)
+        return "".join(full_text)
+
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """生成文本的向量嵌入。
 

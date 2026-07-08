@@ -7,7 +7,7 @@ Recommend node — 症状 → OTC 药品匹配推荐。
   3. Neo4j KG 查候选药品 + 禁忌过滤
   4. ScoringPipeline 确定性评分排序
   5. RAG 检索说明书片段（并行）
-  6. LLM 生成推荐回复文案（DB + RAG 全量透传，纯文本输出）
+  6. LLM 生成推荐回复文案（真正流式，逐 token 推送）
   7. 拼装结果写入 state（match_reason 确定性生成）
 
 数据来源分工：
@@ -15,13 +15,14 @@ Recommend node — 症状 → OTC 药品匹配推荐。
   - PostgreSQL   → 药品元数据 + 权重配置
   - ScoringPipeline → 确定性评分排序（Evidence → Features → Weighted Score）
   - Milvus/RAG   → 药品说明书片段（保留章节标签，由 LLM 自行理解）
-  - LLM          → 自然语言推荐文案（纯文本输出，单次调用）
+  - LLM          → 自然语言推荐文案（真正流式输出）
 """
 
 import asyncio
 import json
 import logging
 
+from app.api.routes.stream_events import push_step, push_token
 from app.db.repositories.drug import DrugRepository
 from app.db.repositories.weight_config import WeightConfigRepository
 from app.llm.client import LLMClient
@@ -67,9 +68,11 @@ async def recommend_node(
     Returns:
         state 更新 dict。
     """
+    q = state.get("_event_queue")
     slots = state.get("consult_slots", {})
     summary = state.get("consult_summary", "")
     session_id = state.get("session_id", "")
+
     # ── 1. 提取症状名称（所有症状等权，不区分主诉/伴随）──
     symptoms = slots.get("symptoms", [])
     symptom_names_raw = _extract_symptom_names(symptoms)
@@ -78,12 +81,26 @@ async def recommend_node(
 
     # ── 1.5. 症状标准化：自由文本 → KG 标准症状名 ──
     if symptom_weights and vocab_source is not None:
+        await push_step(q, "recommend", "normalizing", "症状标准化中...")
         normalizer = SymptomNormalizer(vocab=vocab_source, llm_client=llm_client)
         raw_names = [sw["name"] for sw in symptom_weights]
         norm_result = await normalizer.normalize(raw_names)
         for sw, ns in zip(symptom_weights, norm_result.results):
             sw["_raw_name"] = sw["name"]   # 保留原始名（供调试）
             sw["name"] = ns.standard if ns.standard else ns.raw
+
+        # 推送标准化结果
+        mappings = [
+            {"raw": ns.raw, "standard": ns.standard or ns.raw, "method": ns.method}
+            for ns in norm_result.results
+        ]
+        matched = sum(1 for ns in norm_result.results if ns.standard)
+        await push_step(
+            q, "recommend", "normalized",
+            f"标准化完成: {matched}/{len(raw_names)} 匹配, "
+            f"方法分布: {_summarize_methods(norm_result.results)}",
+            {"mappings": mappings, "llm_calls": norm_result.llm_calls},
+        )
         logger.info(
             "Symptom normalization: %d symptoms, methods=%s, "
             "llm_calls=%d, cache_hits=%d, discarded=%d, %.2fms",
@@ -113,6 +130,7 @@ async def recommend_node(
         symptom_names = [sw["name"] for sw in symptom_weights]
 
     # ── 2. 查询候选药品（KG 唯一数据源）──
+    await push_step(q, "recommend", "searching", "检索候选药品...")
     candidates = await _fetch_candidates(
         drug_graph_repo=drug_graph_repo,
         drug_repo=drug_repo,
@@ -121,15 +139,8 @@ async def recommend_node(
         category="感冒退烧",
     )
 
-    # ── 3. Neo4j 图谱禁忌过滤 ──
-    kg_excluded = await _filter_by_kg_contraindications(
-        drug_graph_repo=drug_graph_repo,
-        candidates=candidates,
-        slots=slots,
-    )
-
-    candidates = [d for d in candidates if d.generic_name not in kg_excluded]
     if not candidates:
+        await push_step(q, "recommend", "no_results", "未找到候选药品")
         return {
             "recommendations": [],
             "response": "抱歉，根据您的情况，目前没有合适的OTC药品推荐。建议您咨询药师或就医。",
@@ -137,7 +148,39 @@ async def recommend_node(
             "node_events": [{"node": "recommend", "count": 0}],
         }
 
+    await push_step(
+        q, "recommend", "searched",
+        f"找到 {len(candidates)} 个候选药品",
+        {"count": len(candidates)},
+    )
+
+    # ── 3. Neo4j 图谱禁忌过滤 ──
+    await push_step(q, "recommend", "filtering", "安全筛查中...")
+    kg_excluded = await _filter_by_kg_contraindications(
+        drug_graph_repo=drug_graph_repo,
+        candidates=candidates,
+        slots=slots,
+    )
+
+    if kg_excluded:
+        await push_step(
+            q, "recommend", "filtered",
+            f"排除 {len(kg_excluded)} 个禁忌药品: {', '.join(kg_excluded)}",
+            {"excluded": kg_excluded},
+        )
+
+    candidates = [d for d in candidates if d.generic_name not in kg_excluded]
+    if not candidates:
+        await push_step(q, "recommend", "all_excluded", "所有候选药品均被安全规则排除")
+        return {
+            "recommendations": [],
+            "response": "抱歉，根据您的安全筛查结果，目前没有合适的OTC药品推荐。建议您咨询药师或就医。",
+            "phase": "ended",
+            "node_events": [{"node": "recommend", "count": 0}],
+        }
+
     # ── 4. ScoringPipeline 确定性评分排序 ──
+    await push_step(q, "recommend", "scoring", "评分排序中...")
     scoring_result = await scoring_pipeline.run(
         candidates=candidates,
         slots=slots,
@@ -153,6 +196,7 @@ async def recommend_node(
     top_drugs = active_drugs[:3]
 
     if not top_drugs:
+        await push_step(q, "recommend", "no_valid", "评分后无有效药品")
         return {
             "recommendations": [],
             "response": "抱歉，根据您的安全筛查结果，目前没有合适的OTC药品推荐。建议您咨询药师或就医。",
@@ -160,13 +204,41 @@ async def recommend_node(
             "node_events": [{"node": "recommend", "count": 0}],
         }
 
-    # ── 5. RAG 检索说明书 ──
-    rag_map = await _fetch_rag_batch(retriever, top_drugs)
+    await push_step(
+        q, "recommend", "scored",
+        f"评分排序完成 ({scoring_result.config_version or 'default'}, "
+        f"{scoring_result.total_time_ms:.0f}ms)",
+        {
+            "version": scoring_result.config_version,
+            "elapsed_ms": round(scoring_result.total_time_ms, 1),
+            "top_drugs": [sd.generic_name for sd in top_drugs],
+        },
+    )
 
-    # ── 6. LLM 生成推荐回复文案（纯文本，DB + RAG 全量透传）──
+    # ── 5. RAG 检索说明书 ──
+    await push_step(q, "recommend", "rag", "检索药品说明书...")
+    rag_map = await _fetch_rag_batch(retriever, top_drugs)
+    rag_count = sum(1 for chunks in rag_map.values() if chunks)
+    await push_step(
+        q, "recommend", "rag_done",
+        f"说明书检索完成: {rag_count}/{len(top_drugs)}",
+    )
+
+    # ── 6. LLM 生成推荐回复文案（真正流式！）──
     top_candidates = [d for d in candidates if d.id in {sd.drug_id for sd in top_drugs}]
     drug_data = _prepare_drug_data(top_drugs, top_candidates, rag_map)
-    response = await _generate_recommend_response(llm_client, drug_data, summary, slots)
+
+    await push_step(q, "recommend", "generating", "正在生成推荐文案...")
+
+    # 构建流式回调
+    async def on_token(token: str) -> None:
+        await push_token(q, token)
+
+    response = await _generate_recommend_response_stream(
+        llm_client, drug_data, summary, slots, on_token,
+    )
+    # 追加免责声明（流式推送）
+    _push_disclaimer(q, DISCLAIMER)
 
     # ── 7. 拼装结果 —— match_reason 确定性生成 ──
     recommendations = []
@@ -184,7 +256,7 @@ async def recommend_node(
 
     return {
         "recommendations": recommendations,
-        "response": response,
+        "response": response + DISCLAIMER,
         "phase": "recommending",
         "node_events": [{
             "node": "recommend",
@@ -206,6 +278,13 @@ def _extract_symptom_names(symptoms: list) -> list[str]:
         s.get("name", s) if isinstance(s, dict) else str(s)
         for s in symptoms
     ]
+
+
+def _summarize_methods(results: list) -> str:
+    """汇总标准化方法分布，如 'kg_exact×2, llm×1'。"""
+    from collections import Counter
+    c = Counter(r.method for r in results)
+    return ", ".join(f"{m}×{n}" for m, n in c.most_common())
 
 
 # ──────────────────────────────────────────────────────────
@@ -440,13 +519,14 @@ RECOMMEND_SYSTEM_PROMPT = """\
 # ──────────────────────────────────────────────────────────
 
 
-async def _generate_recommend_response(
+async def _generate_recommend_response_stream(
     llm_client: LLMClient,
     drug_data: list[dict],
     summary: str,
     slots: dict,
+    on_token: callable = None,
 ) -> str:
-    """LLM 生成推荐回复文案——纯文本输出，不使用 structured output。
+    """流式 LLM 生成推荐回复文案——真正逐 token 推送。
 
     将 LLM 职责从"同时产出结构化理由 + 自然语言文案"简化为
     "只产出一段自然语言文案"。推荐理由（match_reason）由
@@ -454,12 +534,13 @@ async def _generate_recommend_response(
 
     Args:
         llm_client: LLM 客户端
-        drug_data:  每个药品的 DB + RAG 数据（_prepare_drug_data 输出）
+        drug_data:  每个药品的 DB + RAG 数据
         summary:    用户症状摘要
         slots:      用户 consult_slots（含年龄、特殊人群等）
+        on_token:   每个 token 的回调（async callable）
 
     Returns:
-        完整推荐回复文本（含免责声明）。
+        完整推荐回复文本（不含免责声明）。
         LLM 失败时降级为模板拼接。
     """
     # 构建顾客上下文
@@ -478,23 +559,35 @@ async def _generate_recommend_response(
     )
 
     try:
-        result = await llm_client.generate(
+        content = await llm_client.generate_with_stream_callback(
             messages=[
                 {"role": "system", "content": RECOMMEND_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
+            on_token=on_token,
             temperature=0.4,
             max_tokens=2048,
             node="recommend",
         )
-        content = result["choices"][0]["message"]["content"]
-        return content + DISCLAIMER
+        return content
 
     except Exception as e:
         logger.warning(
             "LLM recommend response failed: %s, falling back to template", e
         )
         return _build_fallback_response(drug_data)
+
+
+async def _generate_recommend_response(
+    llm_client: LLMClient,
+    drug_data: list[dict],
+    summary: str,
+    slots: dict,
+) -> str:
+    """LLM 生成推荐回复文案——非流式版本（保留向后兼容）。"""
+    return await _generate_recommend_response_stream(
+        llm_client, drug_data, summary, slots, on_token=None,
+    )
 
 
 # ──────────────────────────────────────────────────────────

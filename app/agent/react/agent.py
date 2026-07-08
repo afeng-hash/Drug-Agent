@@ -94,6 +94,7 @@ class ReactAgent:
         user_message: str,
         history: list[dict[str, str]] | None = None,
         context: dict[str, Any] | None = None,
+        event_queue: Any = None,
     ) -> AgentResult:
         """执行 ReAct 循环，返回 AgentResult。
 
@@ -104,6 +105,8 @@ class ReactAgent:
             context:      动态上下文。通常为 workflow 的输出信息：
                           {"workflow_action": "done"|"ask",
                            "workflow_response": "..."}
+            event_queue:  流式事件队列（asyncio.Queue），用于推送
+                          tool_call/tool_result step 事件
 
         Returns:
             AgentResult — final_response + steps + 耗时统计
@@ -134,7 +137,7 @@ class ReactAgent:
                 # ── 情况 1: LLM 请求工具调用 ──
                 if message.tool_calls:
                     step = await self._handle_tool_calls(
-                        iteration, message, messages
+                        iteration, message, messages, event_queue,
                     )
                     steps.append(step)
                     continue
@@ -258,6 +261,7 @@ class ReactAgent:
         iteration: int,
         assistant_message: Any,
         messages: list[dict[str, Any]],
+        event_queue: Any = None,
     ) -> AgentStep:
         """处理 LLM 返回的 tool_calls。
 
@@ -265,8 +269,11 @@ class ReactAgent:
         2. 并行执行所有工具
         3. 将 assistant message + tool results 追加到 messages
         4. 缓存结果到 memory
-        5. 返回 AgentStep
+        5. 推送 tool_call / tool_result step 事件到 event_queue
+        6. 返回 AgentStep
         """
+        from app.api.routes.stream_events import push_step
+
         # 解析 tool_calls
         raw_calls = assistant_message.tool_calls
         tool_calls: list[ToolCall] = []
@@ -285,6 +292,16 @@ class ReactAgent:
         for tc in raw_calls:
             name = tc.function.name
             args = _safe_json_parse(tc.function.arguments)
+
+            # ── 推送 tool_call step 事件 ──
+            tool_label = _tool_label(name)
+            arg_summary = _arg_summary(args)
+            await push_step(
+                event_queue, "react", "tool_call",
+                f"调用工具: {tool_label}{arg_summary}",
+                {"tool": name, "args": args},
+            )
+
             result = await self.tool_registry.execute(name, args)
 
             # 缓存成功结果
@@ -292,6 +309,21 @@ class ReactAgent:
                 self.memory.add_finding(name, result.data)
 
             tool_results.append(result)
+
+            # ── 推送 tool_result step 事件 ──
+            if result.success:
+                result_summary = _result_summary(result.data)
+                await push_step(
+                    event_queue, "react", "tool_result",
+                    f"{tool_label}: {result_summary}",
+                    {"tool": name, "success": True, "summary": result_summary},
+                )
+            else:
+                await push_step(
+                    event_queue, "react", "tool_result",
+                    f"{tool_label}: 执行失败 — {result.error or '未知错误'}",
+                    {"tool": name, "success": False, "error": result.error},
+                )
 
             # 包装工具结果（空结果标记 + 异常处理）
             wrapped = _wrap_tool_result(result)
@@ -420,6 +452,56 @@ def _safe_json_parse(raw: str | dict) -> dict:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return {}
+
+
+def _tool_label(tool_name: str) -> str:
+    """将工具名映射为人类可读的标签。"""
+    labels = {
+        "search_drug": "查询药品信息",
+        "get_drug_detail": "获取药品详情",
+        "search_manual": "检索说明书",
+        "search_web": "联网搜索",
+        "get_recommendation": "获取推荐列表",
+        "get_user_profile": "获取用户信息",
+    }
+    return labels.get(tool_name, tool_name)
+
+
+def _arg_summary(args: dict) -> str:
+    """生成工具参数的人类可读摘要。"""
+    if not args:
+        return ""
+    # 提取关键参数（跳过 internal 参数）
+    key_args = {k: v for k, v in args.items()
+                if not k.startswith("_") and v}
+    if not key_args:
+        return ""
+    parts = []
+    for k, v in key_args.items():
+        if isinstance(v, str) and len(v) > 30:
+            v = v[:27] + "..."
+        parts.append(f"{k}={v}")
+    return " (" + ", ".join(parts) + ")"
+
+
+def _result_summary(data) -> str:
+    """生成工具返回结果的摘要。"""
+    if data is None:
+        return "无数据"
+    if isinstance(data, list):
+        if len(data) == 0:
+            return "未找到结果"
+        return f"找到 {len(data)} 条记录"
+    if isinstance(data, dict):
+        if data.get("error"):
+            return f"错误: {data['error']}"
+        if data.get("empty") or data.get("found") is False:
+            return "未找到结果"
+        if data.get("source") == "web":
+            results = data.get("results", [])
+            return f"搜索到 {len(results)} 条网页"
+        return f"获取到药品信息 ({len(data)} 字段)"
+    return "获取到数据"
 
 
 def _wrap_tool_result(result: ToolResult) -> dict:

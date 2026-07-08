@@ -29,6 +29,7 @@ from app.agent.react.skills import (
     TASK_SOP_MAP,
 )
 from app.agent.react.skills.types import SOPResult, TaskType
+from app.api.routes.stream_events import push_step, push_token
 from app.graph.state import ConversationState, normalize_messages
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,8 @@ async def react_node(
     Returns:
         state 更新 dict：response, phase, node_events
     """
+    q = state.get("_event_queue")
+
     # ── 0. 统一 normalize messages + 提取 query/intent ──
     raw_messages = state.get("messages", [])
     messages = normalize_messages(raw_messages)
@@ -133,6 +136,7 @@ async def react_node(
         task_classifier=task_classifier,
         response_generator=response_generator,
         react_agent=react_agent,
+        event_queue=q,
     )
 
     # ── 4. 组装最终回复 ──
@@ -177,6 +181,7 @@ async def _execute(
     task_classifier: TaskClassifier | None,
     response_generator: ResponseGenerator | None,
     react_agent: ReactAgent,
+    event_queue=None,
 ) -> str:
     """执行查询——优先 SOP 管线，兜底 ReAct。
 
@@ -188,25 +193,49 @@ async def _execute(
     """
     # ── Fallback 直接返回 ──
     if intent in _FALLBACK_INTENTS or not query:
-        return await _run_react_fallback(query, history, workflow_context, react_agent)
+        await push_step(
+            event_queue, "react", "fallback", "启用 ReAct 推理引擎 (闲聊/空查询)",
+        )
+        return await _run_react_fallback(
+            query, history, workflow_context, react_agent, event_queue,
+        )
 
     # ── Step 1: SkillRouter 确定性路由 ──
     task_type = None
-    classification = None  # 确保 SkillRouter 直路由时变量已定义
+    classification = None
     if skill_router is not None:
         task_type = skill_router.route(
             intent=intent,
             query=query,
             has_recommendations=has_recommendations,
         )
+        if task_type is not None:
+            await push_step(
+                event_queue, "react", "routed",
+                f"SkillRouter: {intent} → {task_type.value}",
+                {"task_type": task_type.value},
+            )
 
     # ── Step 2: TaskClassifier 细分类（需要时） ──
     if task_type is None and task_classifier is not None:
+        await push_step(event_queue, "react", "classifying", "细分任务类型中...")
         classification = await task_classifier.classify(
             query=query,
             history=history,
             context=_build_classify_context(recommendations, workflow_context),
         )
+
+        await push_step(
+            event_queue, "react", "classified",
+            f"TaskClassifier: {classification.task_type.value} "
+            f"(置信度 {classification.confidence:.2f})",
+            {
+                "task_type": classification.task_type.value,
+                "confidence": round(classification.confidence, 3),
+                "drug_names": classification.drug_names if classification else [],
+            },
+        )
+
         # 低置信度 → ReAct fallback
         if classification.confidence < TaskClassifier.MIN_CONFIDENCE:
             logger.debug(
@@ -214,13 +243,25 @@ async def _execute(
                 classification.confidence,
                 TaskClassifier.MIN_CONFIDENCE,
             )
-            return await _run_react_fallback(query, history, workflow_context, react_agent)
+            await push_step(
+                event_queue, "react", "fallback",
+                f"置信度不足 ({classification.confidence:.2f}), 启用 ReAct 推理",
+            )
+            return await _run_react_fallback(
+                query, history, workflow_context, react_agent, event_queue,
+            )
 
         task_type = classification.task_type
 
     # ── Step 3: 获取 SOP 定义 ──
     if task_type is None or task_type not in TASK_SOP_MAP:
-        return await _run_react_fallback(query, history, workflow_context, react_agent)
+        await push_step(
+            event_queue, "react", "fallback",
+            f"未找到 SOP 定义 ({task_type.value if task_type else 'unknown'}), 启用 ReAct 推理",
+        )
+        return await _run_react_fallback(
+            query, history, workflow_context, react_agent, event_queue,
+        )
 
     sop = TASK_SOP_MAP[task_type]
 
@@ -234,21 +275,49 @@ async def _execute(
     )
     if sop_params is None:
         # 参数不足（如 drug_names 为空）→ ReAct fallback
-        return await _run_react_fallback(query, history, workflow_context, react_agent)
+        await push_step(
+            event_queue, "react", "fallback", "SOP 参数不足, 启用 ReAct 推理",
+        )
+        return await _run_react_fallback(
+            query, history, workflow_context, react_agent, event_queue,
+        )
 
     # ── Step 4: SOPEngine 执行（单药 or 多药并行）──
     if sop_engine is None:
-        return await _run_react_fallback(query, history, workflow_context, react_agent)
+        return await _run_react_fallback(
+            query, history, workflow_context, react_agent, event_queue,
+        )
+
+    await push_step(
+        event_queue, "react", "sop_start",
+        f"执行 SOP: {task_type.value} ({len(sop.steps)} 步骤)",
+        {
+            "task_type": task_type.value,
+            "step_count": len(sop.steps),
+            "step_names": [s.tool_name for s in sop.steps],
+        },
+    )
 
     multi_drug_names = sop_params.pop("_multi_drug_names", None)
 
     if multi_drug_names and len(multi_drug_names) > 1:
         # 多药并行 SOP：每种药独立执行，asyncio.gather 并发
+        completed = [0]
+        total = len(multi_drug_names)
+
         async def _execute_one(drug_name: str):
             per_params = {**sop_params, "drug_name": drug_name}
             try:
-                return await sop_engine.execute(sop, per_params)
+                result = await sop_engine.execute(sop, per_params)
+                completed[0] += 1
+                await push_step(
+                    event_queue, "react", "sop_step",
+                    f"SOP 步骤 {completed[0]}/{total}: {drug_name} 完成",
+                    {"drug_name": drug_name},
+                )
+                return result
             except Exception as exc:
+                completed[0] += 1
                 logger.warning("SOP failed for drug '%s': %s", drug_name, exc)
                 return None
 
@@ -263,7 +332,23 @@ async def _execute(
             sop_result.triggered_web_fallback,
         )
     else:
+        # 单药 SOP
         sop_result = await sop_engine.execute(sop, sop_params)
+
+        # 推送每个步骤的结果
+        for i, step in enumerate(sop_result.steps):
+            status = "✓" if step.success else "✗"
+            await push_step(
+                event_queue, "react", "sop_step",
+                f"步骤 {i + 1}/{len(sop.steps)}: {step.tool_name} {status}",
+                {
+                    "step_index": i + 1,
+                    "tool_name": step.tool_name,
+                    "success": step.success,
+                    "has_data": step.data is not None if step.success else False,
+                },
+            )
+
         logger.debug(
             "SOP executed: task=%s, steps=%d, has_data=%s, web=%s",
             task_type,
@@ -272,14 +357,29 @@ async def _execute(
             sop_result.triggered_web_fallback,
         )
 
-    # ── Step 5: ResponseGenerator 生成回复 ──
-    if response_generator is None:
-        return await _run_react_fallback(query, history, workflow_context, react_agent)
+    await push_step(
+        event_queue, "react", "sop_done",
+        f"SOP 完成 (数据: {'有' if sop_result.has_usable_data else '无'}, "
+        f"联网: {'是' if sop_result.triggered_web_fallback else '否'})",
+    )
 
-    response = await response_generator.generate(
+    # ── Step 5: ResponseGenerator 生成回复（流式）──
+    if response_generator is None:
+        return await _run_react_fallback(
+            query, history, workflow_context, react_agent, event_queue,
+        )
+
+    await push_step(event_queue, "react", "generating", "生成回复中...")
+
+    # 构建流式回调
+    async def on_token(token: str) -> None:
+        await push_token(event_queue, token)
+
+    response = await response_generator.generate_stream(
         query=query,
         sop_result=sop_result,
         sop=sop,
+        on_token=on_token,
     )
     return response
 
@@ -294,6 +394,7 @@ async def _run_react_fallback(
     history: list[dict],
     workflow_context: dict | None,
     react_agent: ReactAgent,
+    event_queue=None,
 ) -> str:
     """回退到完整的 ReAct 循环（闲聊/未分类/低置信度）。"""
     logger.debug("Using ReAct fallback for query: %s", query[:50])
@@ -301,6 +402,7 @@ async def _run_react_fallback(
         user_message=query,
         history=history,
         context=workflow_context,
+        event_queue=event_queue,
     )
     return result.final_response
 
@@ -352,7 +454,6 @@ def _build_sop_params(
                 params["drug_a"] = drug_names[0]
                 params["drug_b"] = rec_names[0]
             else:
-                # 只有一个药名且无推荐 → 走 ReAct fallback
                 return None
         else:
             # 没有药名 → 用推荐列表
