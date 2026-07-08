@@ -11,6 +11,7 @@ SafetyBlock node — 症状级别的安全拦截。
 
 import logging
 
+from app.api.routes.stream_events import push_step, push_text_chunked
 from app.graph.state import ConversationState
 from app.rules.engine import RuleEngine
 
@@ -21,9 +22,14 @@ async def safety_block_node(
     state: ConversationState,
     rule_engine: RuleEngine,
 ) -> dict:
-    """症状级别的安全拦截（BLOCK only）。
+    """症状级别的安全拦截（BLOCK only）+ consult 回复的门控推送。
 
-    只执行 RuleEngine 的 BLOCK 阶段：
+    safety_block 现在位于 consult → safety_block 的固定路径上。
+    consult 生成的回复文本在此处根据安全裁决决定是否推送：
+      - BLOCK → 推送安全警告（覆盖 consult 回复）
+      - PASS  → 推送 consult 原始回复
+
+    规则：
       R1: 高烧 > 39°C 持续 3 天
       R2: 3 个月以下婴儿发热
       R3: 孕妇发热 > 38.5°C
@@ -41,10 +47,11 @@ async def safety_block_node(
     Returns:
         state 更新 dict：
           - safety_result → {verdict, triggered_rules, message}
-          - response      → BLOCK 时设为警告文案
+          - response      → BLOCK 时覆盖为警告文案
           - node_events   → 节点事件日志
     """
     slots = state.get("consult_slots", {})
+    q = state.get("_event_queue")
 
     result = rule_engine.check(slots)
 
@@ -54,9 +61,27 @@ async def safety_block_node(
         "message": result.message,
     }
 
-    response = state.get("response", "")
+    consult_response = state.get("response", "")
+
     if result.verdict == "BLOCK":
+        # ── 推送安全警告（覆盖 consult 回复） ──
+        await push_step(
+            q, "safety_block", "blocked",
+            f"安全拦截: {', '.join(r['rule_id'] for r in result.triggered_rules)}",
+            {"verdict": "BLOCK", "triggered_rules": result.triggered_rules},
+        )
+        await push_text_chunked(q, result.message, chunk_size=5, delay=0.02)
         response = result.message
+    else:
+        # ── PASS: 推送 consult 生成的原始回复 ──
+        await push_step(
+            q, "safety_block", "passed",
+            "安全筛查通过",
+            {"verdict": "PASS"},
+        )
+        if consult_response:
+            await push_text_chunked(q, consult_response, chunk_size=5, delay=0.02)
+        response = consult_response
 
     return {
         "safety_result": safety_result,

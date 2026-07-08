@@ -11,7 +11,7 @@ Consult node — ReAct 症状问诊。
 """
 
 from app.agent.consult_agent import run_consult
-from app.api.routes.stream_events import push_step, push_text_chunked
+from app.api.routes.stream_events import push_step
 from app.graph.state import ConversationState, normalize_messages
 from app.llm.client import LLMClient
 
@@ -119,8 +119,11 @@ async def consult_node(
                 {"new_slots": _new_slots_dict(slots, result.updated_slots)},
             )
 
-    # ── 推送 response 文本（分块模拟打字机） ──
-    await push_text_chunked(q, result.response, chunk_size=5, delay=0.02)
+    # ── 将 response 存入 state，推送延迟到 safety_block（避免紧急症状追问文本先于警告输出） ──
+    await push_step(
+        q, "consult", "response_ready",
+        f"回复已生成 ({'done' if result.next_action == 'done' else 'ask'})",
+    )
 
     return {
         "consult_slots": result.updated_slots,

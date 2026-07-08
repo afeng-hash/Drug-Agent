@@ -48,7 +48,6 @@ from app.graph.nodes.react import react_node
 from app.graph.nodes.recommend import recommend_node
 from app.graph.nodes.safety_check import safety_block_node
 from app.graph.router import (
-    route_after_consult,
     route_after_dispatcher,
     route_after_inventory,
     route_after_safety,
@@ -155,23 +154,16 @@ def build_graph(
         },
     )
 
-    # consult → safety_block / react / end
-    graph.add_conditional_edges(
-        "consult",
-        route_after_consult,
-        {
-            "safety_block": "safety_block",
-            "react": "react",
-            "end": "end",
-        },
-    )
+    # consult → safety_block（固定边：所有 consult 输出都经过安全筛查）
+    graph.add_edge("consult", "safety_block")
 
-    # safety_block → recommend / end
+    # safety_block → recommend / react / end
     graph.add_conditional_edges(
         "safety_block",
         route_after_safety,
         {
             "recommend": "recommend",
+            "react": "react",
             "end": "end",
         },
     )

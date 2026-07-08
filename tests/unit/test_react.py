@@ -7,7 +7,6 @@ import pytest
 from app.agent.react.schemas import AgentResult
 from app.graph.nodes.react import react_node
 from app.graph.router import (
-    route_after_consult,
     route_after_dispatcher,
     route_after_inventory,
     route_after_safety,
@@ -47,41 +46,56 @@ class TestRouteAfterDispatcher:
         assert route_after_dispatcher(state) == "react"
 
 
-class TestRouteAfterConsult:
-    def test_done_goes_to_safety(self):
+class TestRouteAfterSafety:
+    def test_block_goes_to_end(self):
+        """BLOCK → end，无论 consult 状态。"""
         state = {
+            "safety_result": {"verdict": "BLOCK"},
             "consult_next_action": "done",
             "dispatcher_result": {"actions": []},
         }
-        assert route_after_consult(state) == "safety_block"
+        assert route_after_safety(state) == "end"
 
-    def test_ask_no_react_goes_to_end(self):
+    def test_pass_done_goes_to_recommend(self):
+        """PASS + consult done → recommend。"""
         state = {
+            "safety_result": {"verdict": "PASS"},
+            "consult_next_action": "done",
+            "dispatcher_result": {"actions": []},
+        }
+        assert route_after_safety(state) == "recommend"
+
+    def test_pass_ask_no_react_goes_to_end(self):
+        """PASS + consult ask + 无 react → end。"""
+        state = {
+            "safety_result": {"verdict": "PASS"},
             "consult_next_action": "ask",
             "dispatcher_result": {"actions": [
                 {"action": "workflow", "intent": "describe_symptom", "priority": 1},
             ]},
         }
-        assert route_after_consult(state) == "end"
+        assert route_after_safety(state) == "end"
 
-    def test_ask_with_react_goes_to_react(self):
+    def test_pass_ask_with_react_goes_to_react(self):
+        """PASS + consult ask + 有 react → react。"""
         state = {
+            "safety_result": {"verdict": "PASS"},
             "consult_next_action": "ask",
             "dispatcher_result": {"actions": [
                 {"action": "workflow", "intent": "describe_symptom", "priority": 1},
                 {"action": "react", "intent": "ask_drug", "priority": 2},
             ]},
         }
-        assert route_after_consult(state) == "react"
+        assert route_after_safety(state) == "react"
 
-
-class TestRouteAfterSafety:
-    def test_pass_goes_to_recommend(self):
-        state = {"safety_result": {"verdict": "PASS"}}
-        assert route_after_safety(state) == "recommend"
-
-    def test_block_goes_to_end(self):
-        state = {"safety_result": {"verdict": "BLOCK"}}
+    def test_pass_no_consult_action_defaults_to_ask(self):
+        """PASS + 无 consult_next_action → 默认视为 ask。"""
+        state = {
+            "safety_result": {"verdict": "PASS"},
+            "dispatcher_result": {"actions": [
+                {"action": "workflow", "intent": "describe_symptom", "priority": 1},
+            ]},
+        }
         assert route_after_safety(state) == "end"
 
 

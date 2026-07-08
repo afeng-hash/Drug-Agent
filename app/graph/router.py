@@ -30,36 +30,30 @@ def route_after_dispatcher(state: ConversationState) -> str:
     return "react"
 
 
-def route_after_consult(state: ConversationState) -> str:
-    """Consult 之后的分发。
-
-    Returns:
-        "safety_block" — consult done，进入安全筛查
-        "react"        — consult ask，但有 react 待执行（过渡到回答用户新问题）
-        "end"          — consult ask，无 react（等待用户下一轮输入）
-    """
-    next_action = state.get("consult_next_action", "ask")
-    actions = _get_actions(state)
-
-    if next_action == "done":
-        return "safety_block"
-
-    # ask: 如果有 react action 需要执行，走 react；否则直接结束本轮
-    has_react = any(a.get("action") == "react" for a in actions)
-    return "react" if has_react else "end"
-
-
 def route_after_safety(state: ConversationState) -> str:
     """Safety 之后的分发。
 
+    safety_block 现在位于 consult → safety_block → ... 的固定路径上，
+    所有 consult 输出都必须经过 safety 检查。
+
     Returns:
-        "recommend" — PASS，进入药品推荐
-        "end"       — BLOCK，终止并返回警告
+        "recommend" — PASS + consult done → 进入药品推荐
+        "react"     — PASS + consult ask + 有 react 待执行
+        "end"       — BLOCK，或 PASS + consult ask + 无 react
     """
     safety = state.get("safety_result", {})
     if safety.get("verdict") == "BLOCK":
         return "end"
-    return "recommend"
+
+    # PASS: 根据 consult 的状态决定下一步
+    next_action = state.get("consult_next_action", "ask")
+    if next_action == "done":
+        return "recommend"
+
+    # ask: 如果有 react action 需要执行，走 react；否则直接结束本轮
+    actions = _get_actions(state)
+    has_react = any(a.get("action") == "react" for a in actions)
+    return "react" if has_react else "end"
 
 
 def route_after_inventory(state: ConversationState) -> str:
