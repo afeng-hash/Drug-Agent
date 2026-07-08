@@ -252,32 +252,21 @@ async def test_max_iterations_force_summarize(tool_registry, system_prompt, reac
 
     通过 mock LLM 始终返回 tool_calls 来触发超限。
     """
-    from openai.types.chat import ChatCompletion, ChatCompletionMessage
-    from openai.types.chat.chat_completion import Choice
-    from openai.types.chat.chat_completion_message_tool_call import (
-        ChatCompletionMessageToolCall,
-        Function,
+    from app.llm.client import StreamWithToolsResult
+
+    # 构造一个始终返回 tool_calls 的 mock result
+    mock_result = StreamWithToolsResult(
+        has_tool_calls=True,
+        tool_calls=[{
+            "id": "call_mock_001",
+            "type": "function",
+            "function": {"name": "search_drug", "arguments": '{"query":"布洛芬"}'},
+        }],
+        content="",
     )
 
-    # 构造一个始终返回 tool_calls 的 mock response
-    mock_response = MagicMock(spec=ChatCompletion)
-    mock_choice = MagicMock(spec=Choice)
-    mock_msg = MagicMock(spec=ChatCompletionMessage)
-
-    # tool_calls 不为空 → LLM 继续请求工具
-    mock_tool_call = MagicMock(spec=ChatCompletionMessageToolCall)
-    mock_tool_call.id = "call_mock_001"
-    mock_tool_call.function = MagicMock(spec=Function)
-    mock_tool_call.function.name = "search_drug"
-    mock_tool_call.function.arguments = '{"query":"布洛芬"}'
-
-    mock_msg.tool_calls = [mock_tool_call]
-    mock_msg.content = None
-    mock_choice.message = mock_msg
-    mock_response.choices = [mock_choice]
-
     mock_llm = AsyncMock()
-    mock_llm.generate_with_tools.return_value = mock_response
+    mock_llm.generate_with_tools_stream.return_value = mock_result
     mock_llm.default_profile = react_profile
 
     agent = ReactAgent(
@@ -302,7 +291,7 @@ async def test_llm_exception_fallback(tool_registry, system_prompt, react_profil
     模拟 LLM 抛异常，验证 agent 返回降级回复。
     """
     mock_llm = AsyncMock()
-    mock_llm.generate_with_tools.side_effect = Exception("Connection refused")
+    mock_llm.generate_with_tools_stream.side_effect = Exception("Connection refused")
     mock_llm.default_profile = react_profile
 
     agent = ReactAgent(
@@ -327,34 +316,25 @@ async def test_llm_exception_fallback_with_findings(tool_registry, system_prompt
 
     先让 agent 的工具执行成功（memory 有数据），然后 LLM 再失败。
     """
-    # 先正常跑一轮让 memory 有数据
-    from openai.types.chat import ChatCompletion, ChatCompletionMessage
-    from openai.types.chat.chat_completion import Choice
-    from openai.types.chat.chat_completion_message_tool_call import (
-        ChatCompletionMessageToolCall,
-        Function,
-    )
+    from app.llm.client import StreamWithToolsResult
 
     mock_llm = AsyncMock()
     mock_llm.default_profile = react_profile
 
     # 第一次调用：返回 tool_calls（让 agent 去执行工具）
-    mock_response1 = MagicMock(spec=ChatCompletion)
-    mock_choice1 = MagicMock(spec=Choice)
-    mock_msg1 = MagicMock(spec=ChatCompletionMessage)
-    mock_tool_call = MagicMock(spec=ChatCompletionMessageToolCall)
-    mock_tool_call.id = "call_001"
-    mock_tool_call.function = MagicMock(spec=Function)
-    mock_tool_call.function.name = "search_drug"
-    mock_tool_call.function.arguments = '{"query":"布洛芬"}'
-    mock_msg1.tool_calls = [mock_tool_call]
-    mock_msg1.content = None
-    mock_choice1.message = mock_msg1
-    mock_response1.choices = [mock_choice1]
+    mock_result1 = StreamWithToolsResult(
+        has_tool_calls=True,
+        tool_calls=[{
+            "id": "call_001",
+            "type": "function",
+            "function": {"name": "search_drug", "arguments": '{"query":"布洛芬"}'},
+        }],
+        content="",
+    )
 
     # 第二次调用：抛异常
-    mock_llm.generate_with_tools.side_effect = [
-        mock_response1,
+    mock_llm.generate_with_tools_stream.side_effect = [
+        mock_result1,
         Exception("API timeout"),
     ]
 

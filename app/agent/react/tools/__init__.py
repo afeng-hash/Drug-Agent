@@ -13,9 +13,12 @@ ReactAgent 工具包。
   - drug_qa:         search_manual（药品问答，Milvus）
   - web_search:      search_web（联网搜索兜底，Bing）
   - state_access:    get_recommendation, get_user_profile（状态读取）
+  - inventory_check: check_inventory, find_drug_location（库存查询/货架位置）
 """
 
 from app.agent.react.tools.base import BaseTool
+from app.agent.react.tools.check_inventory import CheckInventoryTool
+from app.agent.react.tools.find_drug_location import FindDrugLocationTool
 from app.agent.react.tools.get_drug_detail import GetDrugDetailTool
 from app.agent.react.tools.get_recommendation import GetRecommendationTool
 from app.agent.react.tools.get_user_profile import GetUserProfileTool
@@ -31,6 +34,8 @@ __all__ = [
     "GetDrugDetailTool",
     "SearchManualTool",
     "SearchWebTool",
+    "CheckInventoryTool",
+    "FindDrugLocationTool",
     "GetRecommendationTool",
     "GetUserProfileTool",
 ]

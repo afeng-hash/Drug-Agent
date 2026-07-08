@@ -22,7 +22,7 @@ import asyncio
 import json
 import logging
 
-from app.api.routes.stream_events import push_step, push_token
+from app.api.routes.stream_events import push_step, push_text_chunked, push_token
 from app.db.repositories.drug import DrugRepository
 from app.db.repositories.weight_config import WeightConfigRepository
 from app.llm.client import LLMClient
@@ -237,8 +237,8 @@ async def recommend_node(
     response = await _generate_recommend_response_stream(
         llm_client, drug_data, summary, slots, on_token,
     )
-    # 追加免责声明（流式推送）
-    _push_disclaimer(q, DISCLAIMER)
+    # 追加免责声明（流式推送，复用 push_text_chunked）
+    await push_text_chunked(q, DISCLAIMER, chunk_size=5, delay=0.01)
 
     # ── 7. 拼装结果 —— match_reason 确定性生成 ──
     recommendations = []
@@ -575,7 +575,13 @@ async def _generate_recommend_response_stream(
         logger.warning(
             "LLM recommend response failed: %s, falling back to template", e
         )
-        return _build_fallback_response(drug_data)
+        fallback_text = _build_fallback_response(drug_data)
+        # 降级模板也需要流式推送（通过 on_token 逐块发送）
+        if on_token:
+            for i in range(0, len(fallback_text), 5):
+                await on_token(fallback_text[i:i + 5])
+                await asyncio.sleep(0.02)
+        return fallback_text
 
 
 async def _generate_recommend_response(
@@ -634,4 +640,4 @@ def _build_fallback_response(drug_data: list[dict]) -> str:
         if usage:
             lines.append(f"**用法用量**：{usage}\n")
         lines.append("")
-    return "\n".join(lines) + DISCLAIMER
+    return "\n".join(lines)

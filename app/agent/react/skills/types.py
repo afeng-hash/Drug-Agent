@@ -22,6 +22,7 @@ class TaskType(str, Enum):
     DRUG_INTERACTION = "drug_interaction"
     DRUG_COMPARISON = "drug_comparison"
     RECOMMENDATION_EXPLANATION = "recommendation_explanation"
+    INVENTORY_CHECK = "inventory_check"
 
 
 class TaskClassification(BaseModel):

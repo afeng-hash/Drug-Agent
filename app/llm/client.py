@@ -6,8 +6,9 @@ LLM Client — OpenAI-compatible protocol 封装。
   1. generate()            — 普通对话补全
   2. generate_structured() — 结构化输出（JSON Schema → Pydantic）
   3. generate_with_tools() — 带 tool definitions 的单次调用（供 ReactAgent 使用）
-  4. stream()              — 流式输出（逐 token 返回）
-  5. embed()               — 文本向量化（用于 RAG）
+  4. generate_with_tools_stream() — 流式 + tools 调用（ReAct 真流式最终回复）
+  5. stream()              — 流式输出（逐 token 返回）
+  6. embed()               — 文本向量化（用于 RAG）
 
 从 v2 开始，每个方法都接受可选的 LLMProfile 参数，实现按场景分离模型配置。
 配置来源：app.config.Settings（llm_base_url, llm_api_key, llm_model, embedding_model）
@@ -47,6 +48,14 @@ class LLMCallLogData:
     error_message: str | None = None
     session_id: str | None = None
     turn_id: str | None = None
+
+
+@dataclass
+class StreamWithToolsResult:
+    """generate_with_tools_stream() 的返回结果。"""
+    has_tool_calls: bool = False
+    tool_calls: list[dict] = field(default_factory=list)
+    content: str = ""
 
 
 class LLMClient:
@@ -367,6 +376,141 @@ class LLMClient:
             ))
             raise
 
+    async def generate_with_tools_stream(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict],
+        on_token: Callable[[str], Awaitable[None]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        profile: LLMProfile | None = None,
+        tool_choice: str | dict | None = None,
+        node: str | None = None,
+        session_id: str | None = None,
+        **kwargs: Any,
+    ) -> StreamWithToolsResult:
+        """流式调用 LLM（支持 tools），同时通过 on_token 回调推送文本 token。
+
+        与 generate_with_tools() 的区别：
+          - 使用 stream=True，支持实时 token 推送（打字机效果）
+          - 工具调用（tool_calls）在流中增量累积，文本内容实时回调
+          - 兼容 OpenAI stream_options={"include_usage": True}
+
+        Args:
+            messages:    对话消息
+            tools:       OpenAI function calling 格式的 tool 定义列表
+            on_token:    文本 token 回调（仅文本内容触发，tool_call JSON 不触发）
+            temperature: 采样温度
+            max_tokens:  最大输出 token 数
+            profile:     场景配置
+            tool_choice: 工具选择策略
+            node:        调用节点标识
+            session_id:  关联会话 UUID
+
+        Returns:
+            StreamWithToolsResult: has_tool_calls / tool_calls / content
+        """
+        p = profile or self.default_profile
+        model = p.model
+        temp = temperature if temperature is not None else p.temperature
+        max_tok = max_tokens if max_tokens is not None else p.max_tokens
+
+        create_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temp,
+            "max_tokens": max_tok,
+            "tools": tools,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            **kwargs,
+        }
+        if tool_choice is not None:
+            create_kwargs["tool_choice"] = tool_choice
+
+        t0 = time_module.monotonic()
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        # 增量累积 tool_calls（OpenAI 流中分多个 chunk 传输 function name + arguments）
+        tool_calls_acc: dict[int, dict] = {}  # index → {id, function: {name, arguments}}
+        content_parts: list[str] = []
+
+        try:
+            stream = await self.client.chat.completions.create(**create_kwargs)
+
+            async for chunk in stream:
+                # usage chunk（choices 为空）
+                if hasattr(chunk, "usage") and chunk.usage:
+                    prompt_tokens = chunk.usage.prompt_tokens or 0
+                    completion_tokens = chunk.usage.completion_tokens or 0
+                    continue  # usage chunk 没有 choices，跳过后续处理
+
+                if not chunk.choices:
+                    continue
+
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+
+                # ── 累积 tool_calls ──
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {
+                                "id": tc_delta.id or "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        acc = tool_calls_acc[idx]
+                        if tc_delta.id:
+                            acc["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                acc["function"]["name"] += tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                acc["function"]["arguments"] += tc_delta.function.arguments
+
+                # ── 文本内容 → 实时回调 ──
+                if delta.content:
+                    content_parts.append(delta.content)
+                    if on_token:
+                        await on_token(delta.content)
+
+            # 按 index 排序 tool_calls
+            tool_calls = [
+                tool_calls_acc[i]
+                for i in sorted(tool_calls_acc.keys())
+            ]
+
+            self._schedule_log(LLMCallLogData(
+                node=node or "unknown",
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=(time_module.monotonic() - t0) * 1000,
+                success=True,
+                session_id=session_id,
+            ))
+
+            return StreamWithToolsResult(
+                has_tool_calls=len(tool_calls) > 0,
+                tool_calls=tool_calls,
+                content="".join(content_parts),
+            )
+
+        except Exception as exc:
+            self._schedule_log(LLMCallLogData(
+                node=node or "unknown",
+                model=model,
+                latency_ms=(time_module.monotonic() - t0) * 1000,
+                success=False,
+                error_message=str(exc),
+                session_id=session_id,
+            ))
+            raise
+
     async def stream(
         self,
         messages: list[dict[str, str]],
@@ -413,12 +557,14 @@ class LLMClient:
             )
             async for chunk in stream:
                 # 最后一个 chunk 通常包含 usage（取决于 provider 是否支持）
+                # 注意：usage chunk 的 choices 可能为空数组，需先判断
                 if hasattr(chunk, "usage") and chunk.usage:
                     prompt_tokens = chunk.usage.prompt_tokens or 0
                     completion_tokens = chunk.usage.completion_tokens or 0
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    yield delta.content
+                if chunk.choices and chunk.choices[0].delta:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        yield delta.content
 
             self._schedule_log(LLMCallLogData(
                 node=node or "unknown",

@@ -29,6 +29,8 @@ from app.agent.react.skills import (
 )
 from app.agent.react.tools import ToolRegistry
 from app.agent.react.tools.base import BaseTool
+from app.agent.react.tools.check_inventory import CheckInventoryTool
+from app.agent.react.tools.find_drug_location import FindDrugLocationTool
 from app.agent.react.tools.get_drug_detail import GetDrugDetailTool
 from app.agent.react.tools.get_recommendation import GetRecommendationTool
 from app.agent.react.tools.get_user_profile import GetUserProfileTool
@@ -128,7 +130,8 @@ def build_graph(
     graph.add_node(
         "react",
         _make_react(
-            llm_client, drug_repo_factory, retriever, react_profile,
+            llm_client, drug_repo_factory, inventory_repo_factory,
+            retriever, react_profile,
         ),
     )
 
@@ -214,6 +217,7 @@ class _StateProxy:
 def _make_react(
     llm_client: LLMClient,
     drug_repo_factory,
+    inventory_repo_factory,
     retriever: DrugManualRetriever,
     react_profile: LLMProfile | None = None,
 ):
@@ -237,6 +241,14 @@ def _make_react(
         GetDrugDetailTool(drug_repo_factory=drug_repo_factory),
         SearchManualTool(retriever=retriever),
         SearchWebTool(web_search_service=web_search_service),
+        CheckInventoryTool(
+            drug_repo_factory=drug_repo_factory,
+            inventory_repo_factory=inventory_repo_factory,
+        ),
+        FindDrugLocationTool(
+            drug_repo_factory=drug_repo_factory,
+            inventory_repo_factory=inventory_repo_factory,
+        ),
         GetRecommendationTool(state_proxy=state_proxy),
         GetUserProfileTool(state_proxy=state_proxy),
     ]

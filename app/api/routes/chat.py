@@ -132,6 +132,11 @@ def _process_graph_event(
       - on_chain_end    → SSE "node"/"safety"/"data" 事件
       - on_chat_model_stream → SSE "token" 事件（LangGraph 原生流式）
 
+    副作用（调用方需知晓）：
+      - node_start_times: 记录节点开始时间戳（in-place 写入）
+      - node_start_dt:    记录节点开始日期时间（in-place 写入）
+      - trace_events:     追加 TraceLog 事件条目（in-place append）
+
     注意：不再做假流式分块（10 字符切割）。token 事件来自 event_queue
     （Channel 2），由 LLMClient.generate_with_stream_callback() 实时推送。
     """
@@ -300,7 +305,7 @@ async def chat(
         state["_event_queue"] = event_queue
 
         start_time = time_module.time()
-        total_tokens = 0
+        token_event_count = 0  # SSE "token" 事件数（非实际 LLM token 数）
         node_start_times: dict[str, float] = {}
         node_start_dt: dict[str, datetime] = {}
         trace_events: list[dict] = []
@@ -323,12 +328,21 @@ async def chat(
 
         # ── Channel 2 泵：Step/Token 事件 → merged queue ──
         async def pump_bus():
-            while True:
-                msg = await event_queue.get()
-                if msg is None:  # Sentinel — graph 完成后发出
-                    break
-                await merged.put(("bus", msg))
-            await merged.put(("bus_done", None))
+            try:
+                while True:
+                    msg = await event_queue.get()
+                    if msg is None:  # Sentinel — graph 完成后发出
+                        break
+                    await merged.put(("bus", msg))
+            except Exception:
+                # 极端情况：事件循环关闭 / 客户端断开 / merged 被 GC
+                # 确保 bus_done 总是发出，避免主循环永久 hang
+                pass
+            finally:
+                try:
+                    await merged.put(("bus_done", None))
+                except Exception:
+                    pass  # merged 已不可用，无法恢复
 
         graph_task = asyncio.create_task(pump_graph())
         bus_task = asyncio.create_task(pump_bus())
@@ -343,8 +357,8 @@ async def chat(
 
                 if source == "graph_done":
                     graph_ended = True
-                    # 微延迟让残余 bus 事件到达，然后发哨兵
-                    await asyncio.sleep(0.05)
+                    # 节点内部 await push_step/push_token 完成后才 return，
+                    # 因此 graph_done 到达时所有事件已在 event_queue 中，无需等待
                     await event_queue.put(None)
 
                 elif source == "bus_done":
@@ -369,7 +383,7 @@ async def chat(
                         "code": "INTERNAL_ERROR",
                         "message": str(payload),
                     })
-                    await event_queue.put(None)
+                    # 不发 event_queue.put(None) — graph_done 会通过 finally 到达并处理
 
                 elif source == "graph":
                     for sse_text in _process_graph_event(
@@ -378,13 +392,13 @@ async def chat(
                         yield sse_text
                         # 统计 token（来自 on_chat_model_stream 的事件）
                         if "event: token" in sse_text:
-                            total_tokens += 1
+                            token_event_count += 1
 
                 elif source == "bus":
                     event_data = payload
                     yield _sse(event_data["type"], event_data["data"])
                     if event_data["type"] == "token":
-                        total_tokens += 1
+                        token_event_count += 1
 
             # ── 完成 ──
             if not error_occurred:
@@ -392,7 +406,7 @@ async def chat(
                 yield _sse("done", {
                     "session_id": session_id,
                     "elapsed_seconds": elapsed,
-                    "usage": {"tokens": total_tokens},
+                    "usage": {"token_events": token_event_count},
                 })
 
         finally:

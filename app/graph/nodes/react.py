@@ -19,6 +19,7 @@ Skills 架构（v3）：
 
 import asyncio
 import logging
+from typing import Any
 
 from app.agent.react.agent import ReactAgent
 from app.agent.react.skills import (
@@ -37,8 +38,10 @@ logger = logging.getLogger(__name__)
 # ── 需要 TaskClassifier 细分类的 intent ──
 _CLASSIFY_INTENTS = {"ask_drug", None, ""}
 
-# ── ReAct fallback 的 intent ──
-_FALLBACK_INTENTS = {"chat", "give_up"}
+# ── 跳过 TaskClassifier 直通 ReAct 的 intent ──
+# 这些 intent 要么没有对应 SOP（如 chat/give_up），
+# 要么需要实时数据只能走 ReAct（如 check_inventory）。
+_REACT_DIRECT_INTENTS = {"chat", "give_up", "check_inventory"}
 
 
 async def react_node(
@@ -141,7 +144,7 @@ async def react_node(
 
     # ── 4. 组装最终回复 ──
     previous_response = state.get("response", "")
-    if previous_response and intent not in _FALLBACK_INTENTS:
+    if previous_response and intent not in _REACT_DIRECT_INTENTS:
         final_response = f"{previous_response}\n\n{react_response}"
     else:
         final_response = react_response
@@ -181,7 +184,7 @@ async def _execute(
     task_classifier: TaskClassifier | None,
     response_generator: ResponseGenerator | None,
     react_agent: ReactAgent,
-    event_queue=None,
+    event_queue: asyncio.Queue | None = None,
 ) -> str:
     """执行查询——优先 SOP 管线，兜底 ReAct。
 
@@ -191,10 +194,10 @@ async def _execute(
       3. ask_drug → TaskClassifier 细分类 → SOP 管线
       4. 低置信度 / 分类失败 → ReAct fallback
     """
-    # ── Fallback 直接返回 ──
-    if intent in _FALLBACK_INTENTS or not query:
+    # ── 短路：这些 intent 跳过 SkillRouter + TaskClassifier，直通 ReAct ──
+    if intent in _REACT_DIRECT_INTENTS or not query:
         await push_step(
-            event_queue, "react", "fallback", "启用 ReAct 推理引擎 (闲聊/空查询)",
+            event_queue, "react", "fallback", "启用 ReAct 推理引擎",
         )
         return await _run_react_fallback(
             query, history, workflow_context, react_agent, event_queue,
@@ -310,11 +313,15 @@ async def _execute(
             try:
                 result = await sop_engine.execute(sop, per_params)
                 completed[0] += 1
-                await push_step(
-                    event_queue, "react", "sop_step",
-                    f"SOP 步骤 {completed[0]}/{total}: {drug_name} 完成",
-                    {"drug_name": drug_name},
-                )
+                # push_step 异常不应丢弃 SOP 结果
+                try:
+                    await push_step(
+                        event_queue, "react", "sop_step",
+                        f"SOP 步骤 {completed[0]}/{total}: {drug_name} 完成",
+                        {"drug_name": drug_name},
+                    )
+                except Exception:
+                    pass
                 return result
             except Exception as exc:
                 completed[0] += 1
@@ -394,17 +401,26 @@ async def _run_react_fallback(
     history: list[dict],
     workflow_context: dict | None,
     react_agent: ReactAgent,
-    event_queue=None,
+    event_queue: asyncio.Queue | None = None,
 ) -> str:
-    """回退到完整的 ReAct 循环（闲聊/未分类/低置信度）。"""
+    """回退到完整的 ReAct 循环（闲聊/未分类/低置信度）。
+
+    ReAct 最终回复通过 on_token 回调实时流式推送，消除工具调用和文本之间的空白期。
+    """
     logger.debug("Using ReAct fallback for query: %s", query[:50])
+
+    # 构建流式回调：每个文本 token 实时推送到 SSE event_queue
+    async def on_token(token: str) -> None:
+        await push_token(event_queue, token)
+
     result = await react_agent.run(
         user_message=query,
         history=history,
         context=workflow_context,
         event_queue=event_queue,
+        on_token=on_token if event_queue is not None else None,
     )
-    return result.final_response
+    return result.final_response or ""
 
 
 def _build_classify_context(

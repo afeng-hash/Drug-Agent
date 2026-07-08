@@ -28,7 +28,7 @@ class ActionItem(BaseModel):
     )
     intent: str = Field(
         description="意图分类。workflow: describe_symptom | answer_question | want_recommend | switch_drug；"
-                    "react: ask_drug | compare_drugs | ask_interaction | chat | give_up"
+                    "react: ask_drug | compare_drugs | ask_interaction | check_inventory | chat | give_up"
     )
     query: str = Field(
         default="",

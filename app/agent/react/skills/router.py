@@ -25,7 +25,8 @@ INTENT_TO_TASK: dict[str, TaskType | None] = {
     # 明确可直路由的类型
     "compare_drugs": TaskType.DRUG_COMPARISON,
     "ask_interaction": TaskType.DRUG_INTERACTION,
-    # 闲聊/放弃 → ReAct fallback
+    # 直通 ReAct（由 _REACT_DIRECT_INTENTS 短路，不经过此映射）
+    "check_inventory": TaskType.INVENTORY_CHECK,
     "chat": None,
     "give_up": None,
 }

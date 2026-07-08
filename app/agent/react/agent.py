@@ -95,6 +95,7 @@ class ReactAgent:
         history: list[dict[str, str]] | None = None,
         context: dict[str, Any] | None = None,
         event_queue: Any = None,
+        on_token: Any = None,
     ) -> AgentResult:
         """执行 ReAct 循环，返回 AgentResult。
 
@@ -107,6 +108,8 @@ class ReactAgent:
                            "workflow_response": "..."}
             event_queue:  流式事件队列（asyncio.Queue），用于推送
                           tool_call/tool_result step 事件
+            on_token:     文本 token 回调（async callable）。
+                          用于 ReAct 最终回复的真流式推送。
 
         Returns:
             AgentResult — final_response + steps + 耗时统计
@@ -123,27 +126,25 @@ class ReactAgent:
 
         try:
             for iteration in range(1, self.max_iterations + 1):
-                # 单次 LLM 调用（带 tools）
-                response = await self.llm_client.generate_with_tools(
+                # 流式 LLM 调用（带 tools + on_token 实时推送文本）
+                result = await self.llm_client.generate_with_tools_stream(
                     messages=messages,
                     tools=tool_defs,
+                    on_token=on_token,
                     profile=self.profile,
                     node="react",
                 )
 
-                choice = response.choices[0]
-                message = choice.message
-
                 # ── 情况 1: LLM 请求工具调用 ──
-                if message.tool_calls:
-                    step = await self._handle_tool_calls(
-                        iteration, message, messages, event_queue,
+                if result.has_tool_calls:
+                    step = await self._handle_tool_calls_stream(
+                        iteration, result.tool_calls, messages, event_queue,
                     )
                     steps.append(step)
                     continue
 
-                # ── 情况 2: LLM 返回纯文本（最终回复） ──
-                final_response = message.content or ""
+                # ── 情况 2: LLM 返回纯文本（最终回复，token 已通过 on_token 实时推送） ──
+                final_response = result.content or ""
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
 
                 return AgentResult(
@@ -158,7 +159,7 @@ class ReactAgent:
                 "ReactAgent exceeded max_iterations=%d, forcing summarize",
                 self.max_iterations,
             )
-            final_response = await self._force_summarize(messages)
+            final_response = await self._force_summarize(messages, on_token)
             elapsed_ms = (time.perf_counter() - start_time) * 1000
 
             return AgentResult(
@@ -340,24 +341,107 @@ class ReactAgent:
             tool_results=tool_results,
         )
 
+    async def _handle_tool_calls_stream(
+        self,
+        iteration: int,
+        tool_calls_dicts: list[dict],
+        messages: list[dict[str, Any]],
+        event_queue: Any = None,
+    ) -> AgentStep:
+        """处理 generate_with_tools_stream 返回的 tool_calls（dict 格式）。
+
+        与 _handle_tool_calls 逻辑相同，但入参是 StreamWithToolsResult.tool_calls
+        （list[dict]）而非 OpenAI message 对象。
+        """
+        from app.api.routes.stream_events import push_step
+
+        # 解析 tool_calls
+        tool_calls: list[ToolCall] = []
+        for tc in tool_calls_dicts:
+            tool_calls.append(ToolCall(
+                id=tc.get("id", ""),
+                tool_name=tc.get("function", {}).get("name", ""),
+                arguments=_safe_json_parse(tc.get("function", {}).get("arguments", "{}")),
+            ))
+
+        # 将 assistant message（含 tool_calls）追加到 messages
+        messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": tool_calls_dicts,
+        })
+
+        # 并行执行工具
+        tool_results: list[ToolResult] = []
+        for tc in tool_calls_dicts:
+            name = tc.get("function", {}).get("name", "")
+            args = _safe_json_parse(tc.get("function", {}).get("arguments", "{}"))
+
+            # ── 推送 tool_call step 事件 ──
+            tool_label = _tool_label(name)
+            arg_summary = _arg_summary(args)
+            await push_step(
+                event_queue, "react", "tool_call",
+                f"调用工具: {tool_label}{arg_summary}",
+                {"tool": name, "args": args},
+            )
+
+            result = await self.tool_registry.execute(name, args)
+
+            if result.success:
+                self.memory.add_finding(name, result.data)
+
+            tool_results.append(result)
+
+            # ── 推送 tool_result step 事件 ──
+            if result.success:
+                result_summary = _result_summary(result.data)
+                await push_step(
+                    event_queue, "react", "tool_result",
+                    f"{tool_label}: {result_summary}",
+                    {"tool": name, "success": True, "summary": result_summary},
+                )
+            else:
+                await push_step(
+                    event_queue, "react", "tool_result",
+                    f"{tool_label}: 执行失败 — {result.error or '未知错误'}",
+                    {"tool": name, "success": False, "error": result.error},
+                )
+
+            # 包装工具结果并追加到 messages
+            wrapped = _wrap_tool_result(result)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id", ""),
+                "content": json.dumps(wrapped, ensure_ascii=False),
+            })
+
+        return AgentStep(
+            iteration=iteration,
+            thought=None,
+            tool_calls=tool_calls,
+            tool_results=tool_results,
+        )
+
     # ── 降级处理 ──────────────────────────────────────────
 
     async def _force_summarize(
         self,
         messages: list[dict[str, Any]],
+        on_token: Any = None,
     ) -> str:
         """超过 max_iterations 时，强制 LLM 基于已有信息总结。"""
         messages.append({"role": "system", "content": _FORCE_SUMMARIZE_PROMPT})
 
         try:
-            response = await self.llm_client.generate_with_tools(
+            result = await self.llm_client.generate_with_tools_stream(
                 messages=messages,
                 tools=[],  # 不带工具，强制 LLM 只做文本回复
+                on_token=on_token,
                 profile=self.profile,
                 node="react",
             )
-            content = response.choices[0].message.content
-            return content or "抱歉，我无法完成这次查询。请稍后再试。"
+            return result.content or "抱歉，我无法完成这次查询。请稍后再试。"
         except Exception as e:
             logger.error("Force summarize failed: %s", e)
             return self._format_raw_result(str(e))
@@ -461,6 +545,8 @@ def _tool_label(tool_name: str) -> str:
         "get_drug_detail": "获取药品详情",
         "search_manual": "检索说明书",
         "search_web": "联网搜索",
+        "check_inventory": "查询库存",
+        "find_drug_location": "查询货架位置",
         "get_recommendation": "获取推荐列表",
         "get_user_profile": "获取用户信息",
     }

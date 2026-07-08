@@ -5,6 +5,7 @@ ResponseGenerator — LLM #2: 把 SOP 结果变成自然语言回复。
 强制性安全约束由代码注入到 prompt 中，不依赖 LLM 自觉。
 """
 
+import asyncio
 import logging
 from typing import Any
 
@@ -140,6 +141,7 @@ class ResponseGenerator:
             if on_token:
                 for i in range(0, len(sop.fallback_response), 5):
                     await on_token(sop.fallback_response[i:i + 5])
+                    await asyncio.sleep(0.02)
             return sop.fallback_response
 
         # 格式化数据
@@ -169,12 +171,14 @@ class ResponseGenerator:
                     messages=[{"role": "user", "content": prompt}],
                     on_token=on_token,
                     profile=self._profile,
+                    node="react",
                 )
             else:
                 # ── 非流式路径（向后兼容）──
                 response = await self._llm.generate(
                     messages=[{"role": "user", "content": prompt}],
                     profile=self._profile,
+                    node="react",
                 )
                 content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
 
@@ -195,13 +199,19 @@ class ResponseGenerator:
                     if on_token:
                         for i in range(0, len(disclaimer), 5):
                             await on_token(disclaimer[i:i + 5])
+                            await asyncio.sleep(0.02)
 
             return content
 
         except Exception as e:
             logger.error("ResponseGenerator LLM call failed: %s", e)
-            # LLM 不可用 → 返回原始数据摘要
-            return self._raw_fallback(query, sop_result)
+            # LLM 不可用 → 返回原始数据摘要（流式推送以避免前端空白）
+            fallback = self._raw_fallback(query, sop_result)
+            if on_token:
+                for i in range(0, len(fallback), 5):
+                    await on_token(fallback[i:i + 5])
+                    await asyncio.sleep(0.02)
+            return fallback
 
     # ── 内部方法 ────────────────────────────────────────────
 
