@@ -17,6 +17,7 @@ Skills 架构（v3）：
   C. inventory → react → end（workflow done + react 混合意图）
 """
 
+import asyncio
 import logging
 
 from app.agent.react.agent import ReactAgent
@@ -27,7 +28,7 @@ from app.agent.react.skills import (
     ResponseGenerator,
     TASK_SOP_MAP,
 )
-from app.agent.react.skills.types import TaskType
+from app.agent.react.skills.types import SOPResult, TaskType
 from app.graph.state import ConversationState, normalize_messages
 
 logger = logging.getLogger(__name__)
@@ -235,18 +236,41 @@ async def _execute(
         # 参数不足（如 drug_names 为空）→ ReAct fallback
         return await _run_react_fallback(query, history, workflow_context, react_agent)
 
-    # ── Step 4: SOPEngine 执行 ──
+    # ── Step 4: SOPEngine 执行（单药 or 多药并行）──
     if sop_engine is None:
         return await _run_react_fallback(query, history, workflow_context, react_agent)
 
-    sop_result = await sop_engine.execute(sop, sop_params)
-    logger.debug(
-        "SOP executed: task=%s, steps=%d, has_data=%s, web=%s",
-        task_type,
-        len(sop_result.steps),
-        sop_result.has_usable_data,
-        sop_result.triggered_web_fallback,
-    )
+    multi_drug_names = sop_params.pop("_multi_drug_names", None)
+
+    if multi_drug_names and len(multi_drug_names) > 1:
+        # 多药并行 SOP：每种药独立执行，asyncio.gather 并发
+        async def _execute_one(drug_name: str):
+            per_params = {**sop_params, "drug_name": drug_name}
+            try:
+                return await sop_engine.execute(sop, per_params)
+            except Exception as exc:
+                logger.warning("SOP failed for drug '%s': %s", drug_name, exc)
+                return None
+
+        results = await asyncio.gather(
+            *[_execute_one(name) for name in multi_drug_names],
+        )
+        sop_result = _merge_sop_results(results, task_type)
+        logger.debug(
+            "SOP executed (multi-drug ×%d): task=%s, steps=%d, has_data=%s, web=%s",
+            len(multi_drug_names), task_type,
+            len(sop_result.steps), sop_result.has_usable_data,
+            sop_result.triggered_web_fallback,
+        )
+    else:
+        sop_result = await sop_engine.execute(sop, sop_params)
+        logger.debug(
+            "SOP executed: task=%s, steps=%d, has_data=%s, web=%s",
+            task_type,
+            len(sop_result.steps),
+            sop_result.has_usable_data,
+            sop_result.triggered_web_fallback,
+        )
 
     # ── Step 5: ResponseGenerator 生成回复 ──
     if response_generator is None:
@@ -350,16 +374,24 @@ def _build_sop_params(
             params["target_drug"] = classification.target_drug
         # why_recommend / 默认：get_recommendation 不需要参数
 
-    # ── 前 5 个简单类型：需要 1 个药名 ──
+    # ── 前 5 个简单类型：需要 1 个药名（多药时保留全量供并行 SOP 使用）──
     else:
         if drug_names:
             params["drug_name"] = drug_names[0]
+            if len(drug_names) > 1:
+                params["_multi_drug_names"] = drug_names
         else:
             # 尝试从推荐列表获取
             if recommendations:
-                rec_name = recommendations[0].get("generic_name", "")
-                if rec_name:
-                    params["drug_name"] = rec_name
+                rec_names = [
+                    r.get("generic_name", "")
+                    for r in recommendations[:3]
+                    if r.get("generic_name")
+                ]
+                if rec_names:
+                    params["drug_name"] = rec_names[0]
+                    if len(rec_names) > 1:
+                        params["_multi_drug_names"] = rec_names
                 else:
                     return None
             else:
@@ -368,7 +400,48 @@ def _build_sop_params(
         # 特殊人群：注入 population 参数
         if task_type == TaskType.SPECIAL_POPULATION and classification:
             params["population"] = classification.population or "特殊人群"
-            # search_web 用
-            params["web_query"] = params["drug_name"] + " " + params["population"] + " 用药安全"
 
     return params
+
+
+# ═══════════════════════════════════════════════════════════════
+# 多药 SOP 结果合并
+# ═══════════════════════════════════════════════════════════════
+
+
+def _merge_sop_results(
+    results: list,  # list[SOPResult | None]
+    task_type: TaskType,
+) -> SOPResult:
+    """合并多个药物的 SOP 执行结果为一个聚合结果。
+
+    每种药的 SOPResult.steps 按原顺序拼接，聚合元数据取并集（OR语义）：
+      - has_usable_data: 任一药有数据 → True
+      - triggered_web_fallback: 任一药触发了联网 → True
+
+    Args:
+        results:   asyncio.gather 返回的结果列表（含可能的 None/Exception）
+        task_type: 原始任务类型
+
+    Returns:
+        合并后的 SOPResult。若全部结果都无效，返回 has_usable_data=False。
+    """
+    all_steps: list = []
+    has_usable = False
+    triggered_web = False
+
+    for r in results:
+        if r is None or isinstance(r, Exception):
+            continue
+        all_steps.extend(r.steps)
+        if r.has_usable_data:
+            has_usable = True
+        if r.triggered_web_fallback:
+            triggered_web = True
+
+    return SOPResult(
+        task_type=task_type,
+        steps=all_steps,
+        has_usable_data=has_usable,
+        triggered_web_fallback=triggered_web,
+    )
