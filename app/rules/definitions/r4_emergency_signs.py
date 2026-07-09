@@ -4,7 +4,7 @@ from app.rules.base import RuleResult, SafetyRule
 
 EMERGENCY_KEYWORDS = [
     "呼吸困难", "胸痛", "意识模糊", "昏迷",
-    "抽搐", "剧烈头痛", "吐血", "便血",
+    "抽搐", "剧烈头痛", "吐血", "便血","胸闷","呼吸不畅"
 ]
 
 

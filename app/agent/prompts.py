@@ -191,7 +191,7 @@ CONSULT_PROMPT = """你是 OTC 药店症状收集员。你的任务是：
   "duration_days": 3 | null,
   "medications_taken": ["布洛芬"],
   "special_population": null | "孕妇" | "哺乳期" | "儿童" | "老人",
-  "age": 28 | null,
+  "age": 28 | null | 要是没有满一年，比如：俩个月年龄就为 0.2 ,三个月为0.3,
   "chronic_conditions": ["胃溃疡"],
   "allergies": ["阿司匹林"]
 }

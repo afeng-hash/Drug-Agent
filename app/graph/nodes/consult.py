@@ -87,7 +87,7 @@ async def consult_node(
     new_round = consult_rounds + 1
     await push_step(
         q, "consult", "collecting",
-        f"正在收集症状信息 (第 {new_round}/{max_rounds} 轮)",
+        f"正在收集症状信息...",
     )
 
     # 委托给 Consult Agent（核心逻辑在 app/agent/consult_agent.py）
